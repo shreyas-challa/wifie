@@ -14,30 +14,17 @@ use socketioxide::{
 };
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-#[derive(Clone, Default)]
+mod hw;
+
+use hw::{ChannelWidth, HwError, InterfaceMode, SharedBackend};
+
+#[derive(Clone)]
 struct AppState {
-    interfaces: Arc<RwLock<Vec<WirelessInterface>>>,
+    backend: SharedBackend,
     captures: Arc<RwLock<HashMap<Uuid, CaptureTask>>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum InterfaceMode {
-    Managed,
-    Monitor,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WirelessInterface {
-    name: String,
-    phy: String,
-    mac: String,
-    mode: InterfaceMode,
-    supported_bands_ghz: Vec<f32>,
-    channel_mhz: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +64,10 @@ struct MonitorModeRequest {
 #[derive(Debug, Deserialize)]
 struct ChannelRequest {
     interface: String,
-    frequency_mhz: u16,
+    frequency_mhz: u32,
+    /// Optional channel width override; defaults to a sane value for the band.
+    #[serde(default)]
+    width: Option<ChannelWidth>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,7 +75,7 @@ struct HandshakeCaptureRequest {
     interface: String,
     target_bssid: String,
     target_client: Option<String>,
-    channel_mhz: u16,
+    channel_mhz: u32,
     capture_type: CaptureType,
 }
 
@@ -102,12 +92,22 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter("info,wifie_server=debug")
         .init();
 
-    // Placeholder bootstrap demonstrating where netlink_wi and pcap initialize.
-    // TODO: wire actual netlink_wi::NlSocket and interface enumeration.
-    info!("starting WiFie backend (Rust + nl80211 + pcap)");
+    let backend = match hw::select_from_env().await {
+        Ok(b) => {
+            info!(backend = b.name(), "wireless backend ready");
+            b
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "real wireless backend unavailable; falling back to mock backend"
+            );
+            Arc::new(hw::mock::MockBackend::seeded()) as SharedBackend
+        }
+    };
 
     let state = AppState {
-        interfaces: Arc::new(RwLock::new(seed_interfaces())),
+        backend,
         captures: Arc::new(RwLock::new(HashMap::new())),
     };
 
@@ -141,17 +141,20 @@ fn on_socket_connect(socket: SocketRef) {
     let ready = serde_json::json!({ "ok": true });
     socket.emit("server:ready", &ready).ok();
 
-    socket.on("client:ping", |socket: SocketRef, Data::<serde_json::Value>(payload)| {
-        socket
-            .emit(
-                "server:pong",
-                &serde_json::json!({
-                    "echo": payload,
-                    "ts": Utc::now().to_rfc3339(),
-                }),
-            )
-            .ok();
-    });
+    socket.on(
+        "client:ping",
+        |socket: SocketRef, Data::<serde_json::Value>(payload)| {
+            socket
+                .emit(
+                    "server:pong",
+                    &serde_json::json!({
+                        "echo": payload,
+                        "ts": Utc::now().to_rfc3339(),
+                    }),
+                )
+                .ok();
+        },
+    );
 }
 
 fn spawn_telemetry(io: SocketIo) {
@@ -161,58 +164,74 @@ fn spawn_telemetry(io: SocketIo) {
             counter += 1;
             if let Some(ns) = io.of("/events") {
                 ns.emit(
-                "packet:tick",
-                &serde_json::json!({
-                    "seq": counter,
-                    "packets_per_second": 700 + ((counter % 100) as i32),
-                    "noise_floor_dbm": -95 + ((counter % 5) as i32),
-                    "timestamp": Utc::now().timestamp_millis(),
-                }),
-            ).ok();
+                    "packet:tick",
+                    &serde_json::json!({
+                        "seq": counter,
+                        "packets_per_second": 700 + ((counter % 100) as i32),
+                        "noise_floor_dbm": -95 + ((counter % 5) as i32),
+                        "timestamp": Utc::now().timestamp_millis(),
+                    }),
+                )
+                .ok();
             }
             tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         }
     });
 }
 
-async fn health() -> impl IntoResponse {
-    Json(serde_json::json!({ "status": "ok", "service": "wifie-server" }))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "wifie-server",
+        "backend": state.backend.name(),
+    }))
 }
 
 async fn list_interfaces(State(state): State<AppState>) -> impl IntoResponse {
-    Json(state.interfaces.read().await.clone())
+    match state.backend.list_interfaces().await {
+        Ok(list) => Json(serde_json::json!(list)),
+        Err(err) => {
+            error!(?err, "list_interfaces failed");
+            Json(serde_json::json!({ "error": err.to_string(), "interfaces": [] }))
+        }
+    }
 }
 
 async fn toggle_monitor_mode(
     State(state): State<AppState>,
     Json(req): Json<MonitorModeRequest>,
 ) -> impl IntoResponse {
-    let mut interfaces = state.interfaces.write().await;
-    if let Some(iface) = interfaces.iter_mut().find(|i| i.name == req.interface) {
-        // TODO: replace with netlink_wi call to switch interface mode.
-        iface.mode = if req.enable {
-            InterfaceMode::Monitor
-        } else {
-            InterfaceMode::Managed
-        };
-        return Json(serde_json::json!({ "ok": true, "interface": iface }));
+    let mode = if req.enable {
+        InterfaceMode::Monitor
+    } else {
+        InterfaceMode::Managed
+    };
+    match state.backend.set_mode(&req.interface, mode).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "interface": req.interface, "mode": mode })),
+        Err(err) => err_to_json(err),
     }
-
-    Json(serde_json::json!({ "ok": false, "error": "interface_not_found" }))
 }
 
 async fn set_channel(
     State(state): State<AppState>,
     Json(req): Json<ChannelRequest>,
 ) -> impl IntoResponse {
-    let mut interfaces = state.interfaces.write().await;
-    if let Some(iface) = interfaces.iter_mut().find(|i| i.name == req.interface) {
-        // TODO: replace with netlink_wi channel/frequency API for nl80211.
-        iface.channel_mhz = Some(req.frequency_mhz);
-        return Json(serde_json::json!({ "ok": true, "interface": iface }));
+    let width = req
+        .width
+        .unwrap_or_else(|| ChannelWidth::default_for_freq(req.frequency_mhz));
+    match state
+        .backend
+        .set_channel(&req.interface, req.frequency_mhz, width)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "interface": req.interface,
+            "frequency_mhz": req.frequency_mhz,
+            "width": width,
+        })),
+        Err(err) => err_to_json(err),
     }
-
-    Json(serde_json::json!({ "ok": false, "error": "interface_not_found" }))
 }
 
 async fn start_handshake_capture(
@@ -231,8 +250,6 @@ async fn start_handshake_capture(
         error: None,
     };
 
-    // NOTE: This intentionally does not implement frame injection/deauthentication.
-    // It is a safe placeholder for authorized lab integration with pcap/netlink_wi.
     if req.target_client.is_none() {
         warn!("capture requested without target_client, running in passive mode");
     }
@@ -243,7 +260,6 @@ async fn start_handshake_capture(
 }
 
 async fn start_vuln_test_stub(Json(req): Json<VulnerabilityTestRequest>) -> impl IntoResponse {
-    // Safety-first stub: this endpoint only records intent for controlled, ethical testing.
     Json(serde_json::json!({
         "ok": true,
         "message": "stub_only_no_active_attack_logic",
@@ -253,13 +269,16 @@ async fn start_vuln_test_stub(Json(req): Json<VulnerabilityTestRequest>) -> impl
     }))
 }
 
-fn seed_interfaces() -> Vec<WirelessInterface> {
-    vec![WirelessInterface {
-        name: "wlan0".to_string(),
-        phy: "phy0".to_string(),
-        mac: "02:11:22:33:44:55".to_string(),
-        mode: InterfaceMode::Managed,
-        supported_bands_ghz: vec![2.4, 5.0, 6.0],
-        channel_mhz: Some(2412),
-    }]
+fn err_to_json(err: HwError) -> Json<serde_json::Value> {
+    let kind = match &err {
+        HwError::InterfaceNotFound(_) => "interface_not_found",
+        HwError::PermissionDenied => "permission_denied",
+        HwError::Unavailable(_) => "backend_unavailable",
+        HwError::Other(_) => "backend_error",
+    };
+    Json(serde_json::json!({
+        "ok": false,
+        "error": kind,
+        "message": err.to_string(),
+    }))
 }
