@@ -22,7 +22,7 @@ use socketioxide::{
 };
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
         seq: Arc::new(AtomicU64::new(0)),
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/api/interfaces", get(list_interfaces))
         .route("/api/interfaces/monitor-mode", post(toggle_monitor_mode))
@@ -160,7 +160,26 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/captures/deauth", post(send_deauth))
         .route("/api/auth/lab-bssids", get(list_authorized_bssids))
         .route("/api/vuln-tests/start", post(start_vuln_test_stub))
-        .with_state(state)
+        .with_state(state);
+
+    // Production mode: serve the built SPA from the same port. Vite is
+    // not in the loop. WIFIE_SERVE_DIR points at frontend/dist (or any
+    // directory holding index.html + assets/).
+    if let Ok(dir) = std::env::var("WIFIE_SERVE_DIR") {
+        let path = std::path::PathBuf::from(&dir);
+        if !path.join("index.html").exists() {
+            warn!(
+                serve_dir = %dir,
+                "WIFIE_SERVE_DIR is set but index.html not found; SPA will not be served"
+            );
+        } else {
+            info!(serve_dir = %dir, "serving SPA bundle (production mode)");
+            let serve = ServeDir::new(path).append_index_html_on_directories(true);
+            app = app.fallback_service(serve);
+        }
+    }
+
+    let app = app
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .layer(io_layer);

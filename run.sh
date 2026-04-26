@@ -16,6 +16,7 @@ BUILD_ONLY=false
 RUN_BACKEND=true
 RUN_FRONTEND=true
 RELEASE=false
+PROD=false
 
 # ---- ui helpers --------------------------------------------------------------
 c_dim()  { printf '\033[2m%s\033[0m\n' "$*"; }
@@ -34,6 +35,9 @@ Options
   --mock              Use the in-memory mock backend (no caps required)
   --real              Force the real nl80211 backend (default on Linux)
   --release           Build the backend in release mode
+  --prod              Production single-port mode: build SPA, build
+                      release binary, run only the backend serving the
+                      SPA on port 3000 (no Vite, one process).
   --build-only        Build both halves and exit
   --backend-only      Only run the Rust backend
   --frontend-only     Only run the frontend dev server
@@ -52,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --mock)            MODE="mock" ;;
     --real)            MODE="real" ;;
     --release)         RELEASE=true ;;
+    --prod)            PROD=true; RELEASE=true; RUN_FRONTEND=false ;;
     --build-only)      BUILD_ONLY=true ;;
     --backend-only)    RUN_FRONTEND=false ;;
     --frontend-only)   RUN_BACKEND=false ;;
@@ -130,6 +135,12 @@ if $RUN_FRONTEND && [[ ! -d frontend/node_modules ]]; then
   (cd frontend && npm install --silent)
 fi
 
+if $PROD; then
+  c_dim "==> building frontend bundle for production"
+  ( cd frontend && npm install --silent && npm run build )
+  export WIFIE_SERVE_DIR="$ROOT/frontend/dist"
+fi
+
 if $RUN_BACKEND; then
   c_dim "==> building backend (first run takes a couple of minutes)"
   if $RELEASE; then
@@ -172,7 +183,16 @@ if $RUN_FRONTEND; then
   PIDS+=("$!")
 fi
 
-cat <<EOF
+if $PROD; then
+  cat <<EOF
+
+$(c_ok "ready (production single-port).")
+  $(c_dim "open      →  http://localhost:3000")
+  $(c_dim "Ctrl+C    →  stop")
+
+EOF
+else
+  cat <<EOF
 
 $(c_ok "ready.")
   $(c_dim "frontend  →  http://localhost:5173")
@@ -180,6 +200,7 @@ $(c_ok "ready.")
   $(c_dim "Ctrl+C    →  stop both")
 
 EOF
+fi
 
 # Exit as soon as either child dies, so the user sees crashes immediately
 # and the trap cleans up the survivor.
