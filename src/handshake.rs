@@ -61,6 +61,14 @@ pub struct CaptureTask {
     pub eapol_frames_seen: u32,
     pub artifact_path: Option<String>,
     pub error: Option<String>,
+    /// Hashcat 22000-format hashline file produced by `hcxpcapngtool`
+    /// from the captured pcap. Set only after a successful conversion.
+    #[serde(default)]
+    pub hashcat_22000_path: Option<String>,
+    /// Why the 22000 conversion didn't run / didn't produce output:
+    /// `tool_missing`, an exit-code message, or "no hashes extracted".
+    #[serde(default)]
+    pub conversion_error: Option<String>,
 }
 
 pub type CaptureRegistry = Arc<RwLock<HashMap<Uuid, CaptureTask>>>;
@@ -180,6 +188,8 @@ pub async fn spawn(
         eapol_frames_seen: 0,
         artifact_path: Some(artifact.to_string_lossy().into_owned()),
         error: None,
+        hashcat_22000_path: None,
+        conversion_error: None,
     };
     registry.write().await.insert(id, task.clone());
     persist_task(&task);
@@ -295,6 +305,10 @@ pub async fn spawn(
             t.updated_at = Utc::now();
         })
         .await;
+
+        if frames_seen > 0 {
+            convert_to_22000(&registry_for_task, id, &artifact).await;
+        }
         info!(task = %id, "handshake capture: finished");
     });
 
@@ -399,6 +413,59 @@ async fn update_task<F: FnOnce(&mut CaptureTask)>(registry: &CaptureRegistry, id
     };
     if let Some(t) = snapshot {
         persist_task(&t);
+    }
+}
+
+/// Run `hcxpcapngtool` on the captured pcap to produce a hashcat
+/// 22000-mode hashline file. Stored next to the pcap as
+/// `<id>.22000`. Failure modes:
+///   * tool not on PATH      → `conversion_error = "tool_missing: ..."`
+///   * tool ran, no hashes   → `conversion_error = "no hashes extracted"`
+///   * tool exited non-zero  → `conversion_error = "<exit + stderr>"`
+async fn convert_to_22000(registry: &CaptureRegistry, id: Uuid, pcap: &Path) {
+    let out_path = pcap.with_extension("22000");
+
+    let result = tokio::process::Command::new("hcxpcapngtool")
+        .arg("-o")
+        .arg(&out_path)
+        .arg(pcap)
+        .output()
+        .await;
+
+    let outcome: Result<String, String> = match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err("tool_missing: hcxpcapngtool not on PATH (sudo dnf install hcxtools)".to_string())
+        }
+        Err(e) => Err(format!("failed to spawn hcxpcapngtool: {e}")),
+        Ok(out) if !out.status.success() => Err(format!(
+            "hcxpcapngtool exited with {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Ok(_) => match std::fs::metadata(&out_path) {
+            Ok(m) if m.len() > 0 => Ok(out_path.to_string_lossy().into_owned()),
+            _ => Err("no hashes extracted (capture may be incomplete)".to_string()),
+        },
+    };
+
+    match outcome {
+        Ok(path) => {
+            info!(task = %id, %path, "22000 conversion: ok");
+            update_task(registry, id, |t| {
+                t.hashcat_22000_path = Some(path);
+                t.conversion_error = None;
+                t.updated_at = Utc::now();
+            })
+            .await;
+        }
+        Err(err) => {
+            warn!(task = %id, "22000 conversion: {err}");
+            update_task(registry, id, |t| {
+                t.conversion_error = Some(err);
+                t.updated_at = Utc::now();
+            })
+            .await;
+        }
     }
 }
 

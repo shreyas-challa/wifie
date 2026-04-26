@@ -80,6 +80,7 @@ networks the operator doesn't control.
 | Wiphy-aware supported_bands_ghz     | done          | M4: NetlinkBackend caches list_physical_devices |
 | Lab authorization gate              | done          | `WIFIE_LAB_AUTHORIZED_BSSIDS`, `src/auth.rs` |
 | Capture task disk persistence       | done          | N1: JSON sidecar per task; reload on startup |
+| Hashcat 22000 conversion            | done          | N2: hcxpcapngtool post-capture; tool_missing surfaced |
 
 ### Repo layout
 
@@ -212,11 +213,12 @@ JSON sidecar per task lives next to its pcap under
 change. `handshake::load_persisted()` rehydrates the registry on
 startup and demotes any in-flight (Pending/Running) tasks to Failed.
 
-### N2 — Convert captured handshakes to hashcat 22000 format
-Add a small post-capture step that runs `hcxpcapngtool -o <id>.22000
-<id>.pcap` (subprocess; ship a "Download .22000" link in the UI).
-Tool path discovery + tool_missing error using the same pattern as
-`src/vuln.rs`.
+### N2 — Convert captured handshakes to hashcat 22000 format ✓ done
+After a successful capture (frames_seen > 0), the worker runs
+`hcxpcapngtool -o <id>.22000 <id>.pcap` and persists the result on
+the task. Failure modes (`tool_missing`, exit-code, no hashes
+extracted) surface in `conversion_error` so the UI can render them
+without inventing an error type.
 
 ### N3 — UI: artifact downloads + lab BSSID display
 HandshakePanel should surface the artifact path with a download link
