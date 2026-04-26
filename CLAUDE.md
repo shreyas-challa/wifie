@@ -68,6 +68,7 @@ networks the operator doesn't control.
 | `WirelessBackend` trait + selector  | done          | `src/hw/mod.rs`; `WIFIE_HW=mock\|real` |
 | Mock backend                        | done          | `src/hw/mock.rs` |
 | nl80211 backend (real adapters)     | done          | `src/hw/netlink.rs` — verified on user's Alfa |
+| Link-down wrapper around `set_mode` | done          | `src/hw/link.rs`; rtnetlink, in-process so caps survive |
 | Module 1: Interface Management UI   | done          | Real adapters, monitor toggle, channel set |
 | Frontend redesign per DESIGN_SYSTEM | done          | All components in `frontend/src/components/` |
 | Single-command `./run.sh`           | done          | EXIT-trap cleanup, `--mock` / `--release` flags |
@@ -233,13 +234,7 @@ Use `socket.list_physical_devices()` to populate
 `supported_bands_ghz` from the actual hardware capability set instead
 of the heuristic that infers from current frequency.
 
-### M5 — Bring-link-down wrapper around `set_mode`
-Many drivers refuse `NL80211_CMD_SET_INTERFACE` while the netdev is
-UP. Either add an rtnetlink helper or shell out to
-`ip link set <if> down/up` around the call. Surface a clear UI
-confirmation since this kicks NetworkManager off the radio.
-
-### M6 — Vuln-test runners (Module 3, the hardest)
+### M5 — Vuln-test runners (Module 3, the hardest)
 Real Dragonblood / SAE timing probe and KRACK 4-way replay. **Note
 from the user**: the current Alfa adapter has not been validated for
 MitM; first-time tests must use a controlled lab AP. Plan for a small
