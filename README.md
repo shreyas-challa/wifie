@@ -20,11 +20,31 @@ frontend renders telemetry on `<canvas>` and lives entirely in the browser.
 ### Backend (Rust)
 
 ```bash
-cargo run --release
+cargo run --release           # auto-picks the nl80211 backend on Linux
+WIFIE_HW=mock cargo run       # forces the in-memory mock for demos / CI
 ```
 
 The server listens on `0.0.0.0:3000`. Socket.IO is at `/events`; REST routes
-live under `/api/*`.
+live under `/api/*`. `GET /health` reports the active backend
+(`{"backend":"nl80211"}` or `"mock"`).
+
+### Hardware abstraction
+
+All radio control flows through `WirelessBackend` (`src/hw/mod.rs`) — a small
+async trait with three operations: `list_interfaces`, `set_mode`,
+`set_channel`. Two impls ship today:
+
+| Backend     | When                                               | Notes                                            |
+|-------------|----------------------------------------------------|--------------------------------------------------|
+| `mock`      | `WIFIE_HW=mock`, or any non-Linux host             | Seeds two adapters; writes persist in memory.    |
+| `nl80211`   | Default on Linux (`WIFIE_HW=real` to be explicit)  | Wraps `netlink_wi::AsyncNlSocket` against nl80211. |
+
+If the real backend can't connect at startup (no nl80211, missing caps), the
+server logs a warning and falls back to mock — the dashboard never crashes
+and the operator can see why via `/health` + the warning in stderr.
+
+Add a new backend by implementing the trait (see `src/hw/mock.rs` for the
+shortest possible example) and threading it through `select_from_env`.
 
 ### Frontend (React + Vite)
 
