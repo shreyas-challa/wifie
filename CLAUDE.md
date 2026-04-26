@@ -234,9 +234,10 @@ The infrastructure is real but the operator-side verification isn't.
 Walk through one full WPA2 handshake capture against a controlled lab
 AP, confirm the resulting `.pcap` cracks under hashcat with a known
 PSK. This is the milestone that turns "the pipeline runs" into "the
-pipeline works." **Note**: the Alfa is validated for WPA2 cap/crack;
-KRACK and SAE downgrade depend on injection capabilities that haven't
-been exercised — do those second, with a small expected-failure budget.
+pipeline works." **Step-by-step lives in [`LAB_VERIFICATION.md`](LAB_VERIFICATION.md).**
+**Note**: the Alfa is validated for WPA2 cap/crack; KRACK and SAE
+downgrade depend on injection capabilities that haven't been exercised
+— do those second, with a small expected-failure budget.
 
 ### N5 — CI + contributor polish ✓ (mostly) done
 - `rust-toolchain.toml` pinning stable + clippy + rustfmt.
@@ -245,7 +246,69 @@ been exercised — do those second, with a small expected-failure budget.
 - `CONTRIBUTING.md` lists ground rules, dev loop, and a fresh "good
   first issue" set.
 - Still open: a demo `.pcap` checked in for the mock backend to
-  replay so the telemetry graph isn't flat in mock mode.
+  replay so the telemetry graph isn't flat in mock mode (rolled into
+  N9 below).
+
+---
+
+## Post-N4 milestones (open — don't pick these up until N4 is verified)
+
+These build on what's already shipping and assume the WPA2 pipeline
+has been verified end-to-end against the user's lab AP. Reorder if
+the verification surfaces something more urgent.
+
+### N6 — AP / station scanner UI
+The Capture panel asks the operator to type the BSSID by hand. Wrap
+`nl80211 NL80211_CMD_TRIGGER_SCAN` (or worst-case `iw dev <iface>
+scan`) and surface a sortable list of (SSID, BSSID, channel, RSSI,
+last-seen) in the dashboard. A "use this BSSID" button on each row
+populates the Capture target. This is the single biggest UX win — it
+turns wifie from "hexadecimal pen-test toolkit" into something an
+operator can drive in real time.
+
+### N7 — Live capture progress over WS
+`eapol_frames_seen` already updates in the in-memory registry, but the
+frontend only sees it via a 5s poll. Push a `capture:progress`
+event on the existing `/events` Socket.IO namespace whenever the
+pcap thread increments — same shape as `packet:tick`. Drop the
+poller; show a 0/8 EAPOL counter that ticks live in the row.
+
+### N8 — Built-in cracking job runner
+We produce a `.22000` automatically; we don't yet run hashcat. Add
+`POST /api/captures/handshake/:id/crack` that:
+  * Takes a wordlist path or upload.
+  * Spawns `hashcat -m 22000 -a 0 <id>.22000 <wordlist> --status
+    --status-json --status-timer 1` and parses the JSON status lines.
+  * Streams progress (% done, ETA, recovered hashes) over a new
+    `crack:progress` event on the WS.
+  * Returns the recovered PSK in the task record once cracked.
+Same auth gate. The result is the project's headline demo: "click
+this and a few seconds later the dashboard tells you the password."
+
+### N9 — Demo `.pcap` replay in the mock backend
+The mock backend currently emits an empty telemetry stream — the
+Canvas graph is flat. Check in a tiny `.pcap` (a few hundred frames
+from a controlled lab capture, no PII) and have `MockBackend::start_capture`
+replay it on a loop with realistic timing so the dashboard feels
+alive without any radio plugged in. Carries the open piece of N5.
+
+### N10 — WPA3 PMKID path correctness
+The capture filter is `ether proto 0x888e` (EAPOL). PMKID arrives in
+the **first message of the 4-way** but is also exposed via the
+association response when the AP is misconfigured — and on some APs
+it leaks before the 4-way starts. Verify the existing path actually
+captures a usable PMKID against a WPA3-SAE AP (not just a 4-way
+handshake), or split it into a separate `start_capture` filter and
+a separate `hcxpcapngtool` invocation. Update
+[`LAB_VERIFICATION.md`](LAB_VERIFICATION.md) once the answer is
+known.
+
+### N11 — Rate-limit + audit log for offensive routes
+Every successful auth-gated request should append a JSON line to
+`~/.local/share/wifie/audit.log` with timestamp, route, target BSSID,
+and operator (the running uid is fine for now). Optional: a token
+bucket per BSSID so a misclick can't fire 1000 deauths. Cheap, and
+makes every academic write-up about the project trivially defensible.
 
 ---
 

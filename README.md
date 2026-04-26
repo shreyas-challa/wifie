@@ -35,12 +35,34 @@ When you're ready to touch real hardware:
 
 - **Backend** — Rust + `axum` HTTP, `socketioxide` (Socket.IO over WebSocket),
   `netlink_wi` for nl80211, `pcap` for raw frames. Active offensive paths
-  (deauth, SAE downgrade, KRACK replay) are intentionally stubbed in this
-  scaffold.
+  (deauth injection, Dragonblood SAE-timing probe, KRACK 4-way replay) are
+  wired through the auth gate as subprocess wrappers over the published
+  research tools (`aircrack-ng`, `dragondrain-ng`, `krack-ft-test.py`) per
+  the founding spec's hybrid abstraction strategy.
 - **Frontend** — React 18 + Vite + Tailwind v4 (no SSR), `motion` for the
   floating dock + reveal animations, Tabler/Lucide icons, Canvas (no SVG) for
   packet plots. Both light and dark mode ship together; toggle is animated via
   the View Transitions API. Visual language follows `DESIGN_SYSTEM.md`.
+
+## What ships today
+
+| Area                       | Status | How to exercise it                                                 |
+|----------------------------|--------|--------------------------------------------------------------------|
+| Interface management       | live   | `GET /api/interfaces`; UI Interface panel — toggle monitor, set channel |
+| Live packet telemetry      | live   | Boot `./run.sh`, monitor on a real adapter; canvas graph in the UI |
+| WPA2 handshake capture     | live   | Capture panel; targets EAPOL with optional `aireplay-ng` deauth    |
+| Hashcat 22000 export       | live   | Successful captures auto-run `hcxpcapngtool`; `.22000` download chip |
+| Capture artifacts on disk  | live   | Each task: `<id>.pcap` + `<id>.22000` + `<id>.json` in `~/.local/share/wifie/captures/` |
+| Capture restart-resilience | live   | JSON sidecars rehydrate the registry on boot                       |
+| Lab authorization gate     | live   | Set `WIFIE_LAB_AUTHORIZED_BSSIDS=` before any offensive route runs |
+| Dragonblood SAE timing     | wired  | Vuln Lab panel; wraps `dragondrain-ng` (must be on PATH)           |
+| KRACK 4-way replay         | wired  | Vuln Lab panel; wraps `krack-ft-test.py` from Vanhoef's repo       |
+| WPA3 PMKID capture         | partial | Same UI flow, but the EAPOL filter doesn't yet catch PMKID — see CLAUDE.md N10 |
+| Verified WPA2 crack on Alfa | open  | Manual milestone — see [`LAB_VERIFICATION.md`](LAB_VERIFICATION.md) |
+
+For a controlled-AP walkthrough that proves the pipeline end-to-end (deauth →
+EAPOL → 22000 → hashcat crack with a known PSK), see
+[`LAB_VERIFICATION.md`](LAB_VERIFICATION.md).
 
 ## Hardware abstraction
 
@@ -121,12 +143,20 @@ WIFIE_BACKEND_URL=http://10.0.0.5:3000 ./run.sh --frontend-only
 .
 ├─ run.sh                     # single-command bring-up
 ├─ Cargo.toml
+├─ rust-toolchain.toml        # stable + clippy + rustfmt
+├─ .github/workflows/ci.yml   # cargo build + clippy + npm build on PRs
 ├─ DESIGN_SYSTEM.md           # the visual contract — read before touching UI
+├─ LAB_VERIFICATION.md        # N4 manual end-to-end walkthrough
+├─ CONTRIBUTING.md            # ground rules, dev loop, good first issues
 ├─ src/
 │  ├─ main.rs                 # axum + socketioxide bootstrap, REST + WS
+│  ├─ auth.rs                 # lab BSSID allowlist gate
+│  ├─ handshake.rs            # capture pipeline + deauth + 22000 conversion
+│  ├─ vuln.rs                 # Dragonblood / KRACK subprocess runners
 │  └─ hw/
 │     ├─ mod.rs               # WirelessBackend trait, types, env selector
 │     ├─ mock.rs              # in-memory backend
+│     ├─ link.rs              # rtnetlink link up/down wrapper
 │     └─ netlink.rs           # real nl80211 backend (Linux only)
 └─ frontend/
    ├─ index.html

@@ -43,7 +43,7 @@ export function VulnLabPanel({ onRunTest, busy }) {
               onClick={() => onRunTest(t.id)}
               disabled={busy}
             >
-              Run stub
+              Run
             </RippleButton>
           </li>
         ))}
@@ -52,8 +52,10 @@ export function VulnLabPanel({ onRunTest, busy }) {
       <div className="mt-5 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
         <IconAlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" stroke={2} />
         <span>
-          Stubs only. Active offensive logic is intentionally absent from this scaffold —
-          wire it inside the Rust workspace under explicit lab authorization.
+          Runners shell out to published research tools and require the target BSSID
+          to be in <span className="font-mono">WIFIE_LAB_AUTHORIZED_BSSIDS</span>.
+          Anything not on PATH returns <span className="font-mono">tool_missing</span>;
+          install the tool, don't patch the gate.
         </span>
       </div>
     </MinimalCard>

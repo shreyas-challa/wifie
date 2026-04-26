@@ -302,9 +302,15 @@ function Dashboard() {
               </li>
               <li>
                 <span className="font-medium text-foreground">Active offence</span>
-                — deauth injection, SAE timing probes, KRACK replay — is intentionally
-                stubbed. Authorize, then implement inside the corresponding service
-                modules.
+                — deauth injection (aireplay-ng), SAE-timing probe (dragondrain-ng),
+                KRACK 4-way replay (krack-ft-test.py) — is wired as subprocess
+                runners. Every route checks the lab allowlist before touching air.
+              </li>
+              <li>
+                <span className="font-medium text-foreground">Captured artifacts</span>
+                — pcap, hashcat 22000, and a JSON sidecar — land under
+                <span className="font-mono"> ~/.local/share/wifie/captures/</span>
+                and are downloadable from each row in the capture panel.
               </li>
               <li>
                 <span className="font-medium text-foreground">Hardware</span> — bring
