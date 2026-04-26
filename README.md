@@ -5,7 +5,34 @@ in a controlled academic lab. Hardware-agnostic, no proprietary appliance, no
 airmon-ng wrappers — Rust drives `nl80211` and `pcap` directly, the SPA
 frontend renders telemetry on `<canvas>` and lives entirely in the browser.
 
+## Quick start
+
+```bash
+git clone https://github.com/shreyas-challa/wifie.git
+cd wifie
+./run.sh --mock        # demo mode, no caps, no real radio touched
+```
+
+Open <http://localhost:5173>. Both halves of the stack share that one port —
+the React dev server proxies `/api`, `/health`, and `/socket.io` (WebSocket
+upgrade included) to the Rust backend. So if you're SSH'd into another box,
+forward only `5173`:
+
+```bash
+ssh -L 5173:localhost:5173 user@your-linux-host
+```
+
+When you're ready to touch real hardware:
+
+```bash
+./run.sh               # real nl80211 backend (default on Linux)
+```
+
+`./run.sh --help` for all flags (`--release`, `--build-only`,
+`--backend-only`, `--frontend-only`).
+
 ## Stack
+
 - **Backend** — Rust + `axum` HTTP, `socketioxide` (Socket.IO over WebSocket),
   `netlink_wi` for nl80211, `pcap` for raw frames. Active offensive paths
   (deauth, SAE downgrade, KRACK replay) are intentionally stubbed in this
@@ -15,20 +42,7 @@ frontend renders telemetry on `<canvas>` and lives entirely in the browser.
   packet plots. Both light and dark mode ship together; toggle is animated via
   the View Transitions API. Visual language follows `DESIGN_SYSTEM.md`.
 
-## Run
-
-### Backend (Rust)
-
-```bash
-cargo run --release           # auto-picks the nl80211 backend on Linux
-WIFIE_HW=mock cargo run       # forces the in-memory mock for demos / CI
-```
-
-The server listens on `0.0.0.0:3000`. Socket.IO is at `/events`; REST routes
-live under `/api/*`. `GET /health` reports the active backend
-(`{"backend":"nl80211"}` or `"mock"`).
-
-### Hardware abstraction
+## Hardware abstraction
 
 All radio control flows through `WirelessBackend` (`src/hw/mod.rs`) — a small
 async trait with three operations: `list_interfaces`, `set_mode`,
@@ -36,8 +50,8 @@ async trait with three operations: `list_interfaces`, `set_mode`,
 
 | Backend     | When                                               | Notes                                            |
 |-------------|----------------------------------------------------|--------------------------------------------------|
-| `mock`      | `WIFIE_HW=mock`, or any non-Linux host             | Seeds two adapters; writes persist in memory.    |
-| `nl80211`   | Default on Linux (`WIFIE_HW=real` to be explicit)  | Wraps `netlink_wi::AsyncNlSocket` against nl80211. |
+| `mock`      | `--mock` / `WIFIE_HW=mock`, or any non-Linux host  | Seeds two adapters; writes persist in memory.    |
+| `nl80211`   | Default on Linux                                   | Wraps `netlink_wi::AsyncNlSocket` against nl80211. |
 
 If the real backend can't connect at startup (no nl80211, missing caps), the
 server logs a warning and falls back to mock — the dashboard never crashes
@@ -46,23 +60,10 @@ and the operator can see why via `/health` + the warning in stderr.
 Add a new backend by implementing the trait (see `src/hw/mock.rs` for the
 shortest possible example) and threading it through `select_from_env`.
 
-### Frontend (React + Vite)
+## Real hardware setup (Fedora + Alfa-style USB radios)
 
 ```bash
-cd frontend
-npm install
-npm run dev   # http://localhost:5173
-```
-
-`npm run build` produces a static `dist/` you can serve from the Rust binary
-once you wire `tower-http`'s `ServeDir`.
-
-## Hardware notes (Fedora + Alfa adapter)
-
-The dev setup is a Fedora workstation with an Alfa USB radio plugged in.
-
-```bash
-# Build deps for the pcap crate and netlink work
+# Build deps
 sudo dnf install -y libpcap-devel pkgconf-pkg-config
 
 # Optional: tools the lab cracking pipeline shells out to
@@ -73,57 +74,68 @@ Talking to `nl80211` and putting an interface into Monitor Mode requires
 elevated capabilities. Two clean options:
 
 ```bash
-# Option A — run the binary as root for the session
-sudo target/release/wifie-server
+# A — run the binary as root for the session
+sudo ./run.sh
 
-# Option B — grant the binary the specific caps once, then run as your user
-sudo setcap cap_net_admin,cap_net_raw=eip target/release/wifie-server
-target/release/wifie-server
+# B — grant the binary the specific caps once, then run as your user
+./run.sh --build-only
+sudo setcap cap_net_admin,cap_net_raw=eip target/debug/wifie-server
+./run.sh
 ```
 
-NetworkManager will fight you for the radio. Either:
+NetworkManager will fight you for the radio. Release one adapter:
 
 ```bash
-nmcli dev set wlan1 managed no   # release one adapter (replace wlan1)
-# or, fully:
-sudo systemctl stop NetworkManager
+nmcli dev set wlp0s20f0u1i3 managed no   # adjust to your USB Wi-Fi name
 ```
 
 Most Alfa adapters (`rtl88xxau`, `mt76x2u`, `ath9k_htc`) support monitor mode
-and frame injection out of the box on a recent Fedora kernel — you should see
-the radio in `iw dev` and be able to flip it to monitor with `iw dev <iface>
-set type monitor`. The dashboard's "Enable Monitor" button performs the same
-operation through `netlink_wi`.
+and frame injection out of the box on a recent Fedora kernel.
+
+## Hacking on it
+
+Want the two halves in separate terminals (e.g. for clearer log output)?
+
+```bash
+./run.sh --backend-only       # terminal 1
+./run.sh --frontend-only      # terminal 2
+```
+
+Useful endpoints:
+
+```bash
+curl localhost:3000/health           # which backend is live?
+curl localhost:3000/api/interfaces   # what radios are visible?
+```
+
+Override the backend URL the frontend proxies to (split-host setups,
+container networking, etc.):
+
+```bash
+WIFIE_BACKEND_URL=http://10.0.0.5:3000 ./run.sh --frontend-only
+```
 
 ## Layout
 
 ```
 .
-├─ Cargo.toml                 # Rust workspace
-├─ src/main.rs                # axum + socketioxide bootstrap, REST + WS
+├─ run.sh                     # single-command bring-up
+├─ Cargo.toml
 ├─ DESIGN_SYSTEM.md           # the visual contract — read before touching UI
+├─ src/
+│  ├─ main.rs                 # axum + socketioxide bootstrap, REST + WS
+│  └─ hw/
+│     ├─ mod.rs               # WirelessBackend trait, types, env selector
+│     ├─ mock.rs              # in-memory backend
+│     └─ netlink.rs           # real nl80211 backend (Linux only)
 └─ frontend/
    ├─ index.html
-   ├─ vite.config.js          # @tailwindcss/vite + react
+   ├─ vite.config.js          # proxy: /api, /health, /socket.io → backend
    └─ src/
       ├─ App.jsx              # page composition, socket + state
-      ├─ main.jsx
       ├─ styles.css           # oklch zinc tokens (both modes), Tailwind v4
-      ├─ lib/
-      │  ├─ utils.js          # cn()
-      │  └─ theme.jsx         # ThemeProvider + useTheme
-      └─ components/
-         ├─ MinimalCard.jsx
-         ├─ RippleButton.jsx
-         ├─ FloatingDock.jsx
-         ├─ AnimatedThemeToggler.jsx
-         ├─ EncryptedText.jsx
-         ├─ RevealOnScroll.jsx
-         ├─ PacketCanvas.jsx
-         ├─ Field.jsx
-         ├─ InterfacePanel.jsx
-         ├─ HandshakePanel.jsx
-         └─ VulnLabPanel.jsx
+      ├─ lib/                 # cn(), ThemeProvider
+      └─ components/          # MinimalCard, RippleButton, FloatingDock, …
 ```
 
 ## Safety
