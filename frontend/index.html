@@ -3,9 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WiFie Dashboard</title>
+    <title>WiFie — Wireless Audit Console</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("vite-ui-theme");
+          var prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+          var theme = stored || "system";
+          var resolved = theme === "system" ? (prefersDark ? "dark" : "light") : theme;
+          if (resolved === "dark") document.documentElement.classList.add("dark");
+        } catch (_) {}
+      })();
+    </script>
   </head>
-  <body class="bg-zinc-950">
+  <body>
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
   </body>

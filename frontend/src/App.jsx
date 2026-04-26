@@ -1,29 +1,69 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
+import {
+  IconAntennaBars5,
+  IconKey,
+  IconShieldHalfFilled,
+  IconActivity,
+  IconBook
+} from "@tabler/icons-react";
+
+import { ThemeProvider } from "./lib/theme";
+import { AnimatedThemeToggler } from "./components/AnimatedThemeToggler";
+import { FloatingDock } from "./components/FloatingDock";
+import { MinimalCard, MinimalCardHeader } from "./components/MinimalCard";
+import { PacketCanvas } from "./components/PacketCanvas";
+import { EncryptedText } from "./components/EncryptedText";
+import { RevealOnScroll } from "./components/RevealOnScroll";
+import { Tag } from "./components/Field";
+import { InterfacePanel } from "./components/InterfacePanel";
+import { HandshakePanel } from "./components/HandshakePanel";
+import { VulnLabPanel } from "./components/VulnLabPanel";
 
 const API_BASE = "http://localhost:3000";
-const FREQUENCY_PRESETS = [2412, 2437, 2462, 5180, 5200, 5745, 5955, 6115, 6375];
 
-export default function App() {
+const SECTIONS = [
+  { id: "telemetry", label: "Telemetry", icon: IconActivity },
+  { id: "interfaces", label: "Interfaces", icon: IconAntennaBars5 },
+  { id: "capture", label: "Capture", icon: IconKey },
+  { id: "vuln-lab", label: "Vuln Lab", icon: IconShieldHalfFilled },
+  { id: "notes", label: "Notes", icon: IconBook }
+];
+
+function scrollToSection(id) {
+  const el = document.getElementById(id);
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function Dashboard() {
   const [socketConnected, setSocketConnected] = useState(false);
   const [packetTicks, setPacketTicks] = useState([]);
   const [interfaces, setInterfaces] = useState([]);
   const [selectedInterface, setSelectedInterface] = useState("wlan0");
   const [selectedFreq, setSelectedFreq] = useState(2412);
   const [targetBssid, setTargetBssid] = useState("AA:BB:CC:DD:EE:FF");
+  const [targetClient, setTargetClient] = useState("");
+  const [captureType, setCaptureType] = useState("wpa2_handshake");
+  const [recentCaptures, setRecentCaptures] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [activeSection, setActiveSection] = useState("telemetry");
 
-  const canvasRef = useRef(null);
-
-  const socket = useMemo(() => io(`${API_BASE}/events`, { transports: ["websocket"] }), []);
+  const socket = useMemo(
+    () => io(`${API_BASE}/events`, { transports: ["websocket"] }),
+    []
+  );
 
   useEffect(() => {
     fetch(`${API_BASE}/api/interfaces`)
-      .then((res) => res.json())
+      .then((r) => r.json())
       .then((data) => {
         setInterfaces(data);
         if (data[0]?.name) setSelectedInterface(data[0].name);
+        if (data[0]?.channel_mhz) setSelectedFreq(data[0].channel_mhz);
       })
-      .catch(console.error);
+      .catch(() => {
+        setInterfaces([]);
+      });
   }, []);
 
   useEffect(() => {
@@ -32,7 +72,6 @@ export default function App() {
     socket.on("packet:tick", (tick) => {
       setPacketTicks((prev) => [...prev.slice(-119), tick]);
     });
-
     return () => {
       socket.removeAllListeners();
       socket.disconnect();
@@ -40,112 +79,244 @@ export default function App() {
   }, [socket]);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const targets = SECTIONS.map((s) => document.getElementById(s.id)).filter(Boolean);
+    if (!targets.length) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
+        if (visible[0]) setActiveSection(visible[0].target.id);
+      },
+      { rootMargin: "-30% 0px -55% 0px", threshold: [0, 0.25, 0.5, 0.75, 1] }
+    );
+    targets.forEach((t) => observer.observe(t));
+    return () => observer.disconnect();
+  }, []);
 
-    const ctx = canvas.getContext("2d");
-    const { width, height } = canvas;
-    ctx.clearRect(0, 0, width, height);
-
-    ctx.fillStyle = "#09090b";
-    ctx.fillRect(0, 0, width, height);
-
-    ctx.strokeStyle = "#1f2937";
-    ctx.lineWidth = 1;
-    for (let y = 0; y < 5; y += 1) {
-      const gy = (height / 5) * y;
-      ctx.beginPath();
-      ctx.moveTo(0, gy);
-      ctx.lineTo(width, gy);
-      ctx.stroke();
+  const post = useCallback(async (path, payload) => {
+    setBusy(true);
+    try {
+      const res = await fetch(`${API_BASE}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      return await res.json();
+    } finally {
+      setBusy(false);
     }
+  }, []);
 
-    if (packetTicks.length < 2) return;
+  const refreshInterfaces = useCallback(async () => {
+    const fresh = await fetch(`${API_BASE}/api/interfaces`).then((r) => r.json());
+    setInterfaces(fresh);
+  }, []);
 
-    const maxPps = Math.max(...packetTicks.map((p) => p.packets_per_second), 1000);
-    ctx.strokeStyle = "#22d3ee";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-
-    packetTicks.forEach((tick, idx) => {
-      const x = (idx / (packetTicks.length - 1)) * width;
-      const y = height - (tick.packets_per_second / maxPps) * (height - 8) - 4;
-      if (idx === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+  const handleToggleMonitor = async (enable) => {
+    await post("/api/interfaces/monitor-mode", {
+      interface: selectedInterface,
+      enable
     });
+    await refreshInterfaces();
+  };
 
-    ctx.stroke();
-  }, [packetTicks]);
-
-  async function post(path, payload) {
-    const res = await fetch(`${API_BASE}${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
+  const handleSetChannel = async () => {
+    await post("/api/interfaces/channel", {
+      interface: selectedInterface,
+      frequency_mhz: selectedFreq
     });
-    return res.json();
-  }
+    await refreshInterfaces();
+  };
+
+  const handleStartCapture = async () => {
+    const out = await post("/api/captures/handshake", {
+      interface: selectedInterface,
+      target_bssid: targetBssid,
+      target_client: targetClient || null,
+      channel_mhz: selectedFreq,
+      capture_type: captureType
+    });
+    if (out?.task) {
+      setRecentCaptures((prev) => [out.task, ...prev].slice(0, 6));
+    }
+  };
+
+  const handleRunVuln = async (testCase) => {
+    await post("/api/vuln-tests/start", {
+      interface: selectedInterface,
+      target_bssid: targetBssid,
+      test_case: testCase
+    });
+  };
+
+  const lastTick = packetTicks[packetTicks.length - 1];
+  const dockItems = SECTIONS.map((s) => ({
+    ...s,
+    active: s.id === activeSection,
+    onSelect: () => scrollToSection(s.id)
+  }));
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100 p-6">
-      <div className="mx-auto grid max-w-7xl gap-6 lg:grid-cols-3">
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-5 lg:col-span-2">
-          <header className="mb-4 flex items-center justify-between">
-            <h1 className="text-xl font-semibold text-accent-400">WiFie Live Telemetry</h1>
-            <span className={`rounded-full px-3 py-1 text-xs ${socketConnected ? "bg-emerald-600/30 text-emerald-300" : "bg-rose-600/30 text-rose-300"}`}>
-              {socketConnected ? "WS Connected" : "WS Disconnected"}
+    <div className="relative flex min-h-screen w-full flex-col items-center bg-background text-foreground">
+      <header className="sticky top-0 z-40 w-full border-b border-border/60 bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
+        <div className="mx-auto flex h-14 w-full max-w-[1200px] items-center justify-between px-6">
+          <div className="flex items-center gap-2">
+            <span className="inline-flex h-6 w-6 items-center justify-center rounded-md bg-foreground text-background">
+              <span className="text-[10px] font-bold tracking-tight">W</span>
             </span>
-          </header>
-          <canvas ref={canvasRef} width={1000} height={320} className="h-80 w-full rounded-lg border border-zinc-800" />
-          <p className="mt-3 text-sm text-zinc-400">Canvas-rendered packets/second graph (optimized for high-frequency streams).</p>
-        </section>
-
-        <section className="rounded-2xl border border-zinc-800 bg-zinc-900 p-5">
-          <h2 className="mb-4 text-lg font-semibold">Advanced Interface Management</h2>
-          <div className="space-y-3 text-sm">
-            <label className="block">
-              Interface
-              <select value={selectedInterface} onChange={(e) => setSelectedInterface(e.target.value)} className="mt-1 w-full rounded bg-zinc-800 px-3 py-2">
-                {interfaces.map((i) => <option key={i.name}>{i.name}</option>)}
-              </select>
-            </label>
-
-            <label className="block">
-              Frequency (MHz)
-              <select value={selectedFreq} onChange={(e) => setSelectedFreq(Number(e.target.value))} className="mt-1 w-full rounded bg-zinc-800 px-3 py-2">
-                {FREQUENCY_PRESETS.map((f) => <option key={f} value={f}>{f}</option>)}
-              </select>
-            </label>
-
-            <div className="grid grid-cols-2 gap-2">
-              <button className="rounded bg-accent-500 px-3 py-2 font-medium text-zinc-900" onClick={() => post("/api/interfaces/monitor-mode", { interface: selectedInterface, enable: true })}>Enable Monitor</button>
-              <button className="rounded bg-zinc-700 px-3 py-2" onClick={() => post("/api/interfaces/channel", { interface: selectedInterface, frequency_mhz: selectedFreq })}>Set Channel</button>
-            </div>
+            <span className="text-sm font-semibold tracking-tight">wifie</span>
+            <span className="ml-2 hidden text-xs text-muted-foreground sm:inline">
+              Wireless audit console — local lab build
+            </span>
           </div>
-
-          <h2 className="mb-3 mt-6 text-lg font-semibold">Handshake Capture</h2>
-          <input value={targetBssid} onChange={(e) => setTargetBssid(e.target.value)} className="w-full rounded bg-zinc-800 px-3 py-2 text-sm" />
-          <button
-            className="mt-2 w-full rounded bg-indigo-500 px-3 py-2 text-sm font-medium"
-            onClick={() =>
-              post("/api/captures/handshake", {
-                interface: selectedInterface,
-                target_bssid: targetBssid,
-                channel_mhz: selectedFreq,
-                capture_type: "wpa2_handshake"
-              })
-            }
-          >
-            Start Capture (Stub)
-          </button>
-
-          <h2 className="mb-3 mt-6 text-lg font-semibold">Vulnerability Re-implementation (Lab)</h2>
-          <div className="grid gap-2">
-            <button className="rounded bg-amber-500 px-3 py-2 text-sm font-medium text-zinc-900" onClick={() => post("/api/vuln-tests/start", { interface: selectedInterface, target_bssid: targetBssid, test_case: "dragonblood_sae_timing_stub" })}>Dragonblood/SAE Stub</button>
-            <button className="rounded bg-rose-500 px-3 py-2 text-sm font-medium" onClick={() => post("/api/vuln-tests/start", { interface: selectedInterface, target_bssid: targetBssid, test_case: "krack_4way_replay_stub" })}>KRACK Stub</button>
+          <div className="flex items-center gap-3">
+            <Tag tone={socketConnected ? "monitor" : "danger"}>
+              <span
+                className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${
+                  socketConnected ? "bg-background" : "bg-destructive"
+                }`}
+              />
+              {socketConnected ? "WS live" : "WS offline"}
+            </Tag>
+            <AnimatedThemeToggler />
           </div>
-        </section>
+        </div>
+      </header>
+
+      <main className="w-full max-w-[1200px] flex-1 px-6 pb-32 pt-12 sm:pt-16">
+        <RevealOnScroll>
+          <section className="mb-10">
+            <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
+              Console
+            </p>
+            <h1 className="mt-3 text-4xl font-bold tracking-tight sm:text-5xl">
+              <EncryptedText text="WIFIE" className="text-foreground" />
+              <span className="ml-3 align-middle text-base font-normal text-muted-foreground">
+                / Wi-Fi 6 · 6E · 7 audit
+              </span>
+            </h1>
+            <p className="mt-3 max-w-xl text-sm text-muted-foreground">
+              A local-host, hardware-agnostic dashboard for academic wireless
+              penetration testing — Rust nl80211 control plane, Canvas-rendered
+              telemetry, no proprietary boxes in the loop.
+            </p>
+          </section>
+        </RevealOnScroll>
+
+        <RevealOnScroll>
+          <MinimalCard id="telemetry">
+            <MinimalCardHeader
+              icon={IconActivity}
+              eyebrow="Live"
+              title="Packet Telemetry"
+              description="Canvas-driven packets-per-second graph, fed by the socketioxide /events namespace."
+            />
+
+            <PacketCanvas ticks={packetTicks} />
+
+            <dl className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+              <Stat
+                label="pps (live)"
+                value={lastTick?.packets_per_second ?? 0}
+              />
+              <Stat
+                label="noise floor"
+                value={lastTick ? `${lastTick.noise_floor_dbm} dBm` : "—"}
+              />
+              <Stat label="samples" value={packetTicks.length} />
+              <Stat label="seq" value={lastTick?.seq ?? 0} />
+            </dl>
+          </MinimalCard>
+        </RevealOnScroll>
+
+        <div className="mt-8 grid gap-8 lg:grid-cols-2">
+          <RevealOnScroll delay={75}>
+            <InterfacePanel
+              interfaces={interfaces}
+              selectedInterface={selectedInterface}
+              selectedFreq={selectedFreq}
+              onSelectInterface={setSelectedInterface}
+              onSelectFreq={setSelectedFreq}
+              onToggleMonitor={handleToggleMonitor}
+              onSetChannel={handleSetChannel}
+              busy={busy}
+            />
+          </RevealOnScroll>
+
+          <RevealOnScroll delay={150}>
+            <HandshakePanel
+              targetBssid={targetBssid}
+              onTargetBssidChange={setTargetBssid}
+              targetClient={targetClient}
+              onTargetClientChange={setTargetClient}
+              captureType={captureType}
+              onCaptureTypeChange={setCaptureType}
+              onStartCapture={handleStartCapture}
+              recentCaptures={recentCaptures}
+              busy={busy}
+            />
+          </RevealOnScroll>
+        </div>
+
+        <RevealOnScroll delay={75} className="mt-8 block">
+          <VulnLabPanel onRunTest={handleRunVuln} busy={busy} />
+        </RevealOnScroll>
+
+        <RevealOnScroll delay={75} className="mt-8 block">
+          <MinimalCard id="notes">
+            <MinimalCardHeader
+              icon={IconBook}
+              eyebrow="Operator"
+              title="Lab notes"
+              description="Quick reference for what is real vs. stubbed in this build."
+            />
+            <ul className="space-y-2 text-sm text-muted-foreground">
+              <li>
+                <span className="font-medium text-foreground">Passive paths</span> —
+                interface enumeration, monitor toggle, channel set, telemetry stream
+                — are wired through axum + nl80211 abstractions on the Rust side.
+              </li>
+              <li>
+                <span className="font-medium text-foreground">Active offence</span>
+                — deauth injection, SAE timing probes, KRACK replay — is intentionally
+                stubbed. Authorize, then implement inside the corresponding service
+                modules.
+              </li>
+              <li>
+                <span className="font-medium text-foreground">Hardware</span> — bring
+                your own monitor-mode capable adapter (Alfa, ath9k_htc, mt76, etc.)
+                and run the backend with CAP_NET_ADMIN + CAP_NET_RAW.
+              </li>
+            </ul>
+          </MinimalCard>
+        </RevealOnScroll>
+      </main>
+
+      <div className="pointer-events-none fixed inset-x-0 bottom-3 z-50 flex justify-center">
+        <div className="pointer-events-auto">
+          <FloatingDock items={dockItems} />
+        </div>
       </div>
-    </main>
+    </div>
+  );
+}
+
+function Stat({ label, value }) {
+  return (
+    <div className="rounded-xl border border-border bg-background/60 px-3 py-2.5 dark:bg-neutral-900/40">
+      <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
+        {label}
+      </p>
+      <p className="mt-1 font-mono text-lg font-semibold text-foreground">{value}</p>
+    </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ThemeProvider defaultTheme="system">
+      <Dashboard />
+    </ThemeProvider>
   );
 }
