@@ -29,6 +29,7 @@ use uuid::Uuid;
 mod auth;
 mod handshake;
 mod hw;
+mod vuln;
 
 use handshake::{CaptureRegistry, CaptureType, CaptureTask};
 use hw::{
@@ -112,7 +113,7 @@ struct DeauthRequest {
 struct VulnerabilityTestRequest {
     interface: String,
     target_bssid: String,
-    test_case: String,
+    test_case: vuln::TestCase,
 }
 
 #[derive(Debug, Deserialize)]
@@ -511,14 +512,25 @@ fn auth_denied(target: &str) -> Json<serde_json::Value> {
     }))
 }
 
-async fn start_vuln_test_stub(Json(req): Json<VulnerabilityTestRequest>) -> impl IntoResponse {
-    Json(serde_json::json!({
-        "ok": true,
-        "message": "stub_only_no_active_attack_logic",
-        "interface": req.interface,
-        "target_bssid": req.target_bssid,
-        "test_case": req.test_case
-    }))
+async fn start_vuln_test_stub(Json(req): Json<VulnerabilityTestRequest>) -> Json<serde_json::Value> {
+    if !auth::is_authorized(&req.target_bssid) {
+        return auth_denied(&req.target_bssid);
+    }
+    match vuln::run(req.test_case, &req.interface, &req.target_bssid).await {
+        Ok(result) => Json(serde_json::json!({ "ok": true, "result": result })),
+        Err(err) => {
+            let kind = if err.starts_with("tool_missing") {
+                "tool_missing"
+            } else {
+                "vuln_test_failed"
+            };
+            Json(serde_json::json!({
+                "ok": false,
+                "error": kind,
+                "message": err,
+            }))
+        }
+    }
 }
 
 fn err_to_json(err: HwError) -> Json<serde_json::Value> {

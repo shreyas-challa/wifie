@@ -4,16 +4,16 @@ import { RippleButton } from "./RippleButton";
 
 const TESTS = [
   {
-    id: "dragonblood_sae_timing_stub",
+    id: "dragonblood_sae_timing",
     title: "Dragonblood / SAE timing",
     description:
-      "Controlled SAE handshake downgrade probe to evaluate WPA3 client resilience. Lab use only."
+      "Controlled SAE handshake downgrade probe to evaluate WPA3 client resilience. Wraps dragondrain-ng. Lab use only."
   },
   {
-    id: "krack_4way_replay_stub",
+    id: "krack_4way_replay",
     title: "KRACK 4-way replay",
     description:
-      "Evil-twin 4-way handshake manipulation against the in-lab AP to replay key frames."
+      "Evil-twin 4-way handshake manipulation against the in-lab AP to replay key frames. Wraps krack-ft-test.py."
   }
 ];
 

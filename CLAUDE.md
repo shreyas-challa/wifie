@@ -73,10 +73,12 @@ networks the operator doesn't control.
 | Frontend redesign per DESIGN_SYSTEM | done          | All components in `frontend/src/components/` |
 | Single-command `./run.sh`           | done          | EXIT-trap cleanup, `--mock` / `--release` flags |
 | Same-origin Vite proxy              | done          | `/api`, `/health`, `/socket.io` (ws) → backend |
-| Module 2: Handshake Capture         | **stubbed**   | UI + task records only; no pcap loop, no deauth |
-| Module 3: Vuln tests (Dragonblood/KRACK) | **stubbed** | UI + intent endpoint only; no exploit logic |
-| Real packet telemetry               | **synthetic** | `spawn_telemetry` emits a counter, not pcap |
-| Production binary (Rust serves SPA) | not started   | `tower-http::ServeDir` + `--prod` mode |
+| Module 2: Handshake Capture         | done          | `src/handshake.rs` — EAPOL pcap + deauth via aireplay-ng + auth gate |
+| Module 3: Vuln tests (Dragonblood/KRACK) | scaffolded | `src/vuln.rs` wraps dragondrain-ng / krack-ft-test.py; gated |
+| Real packet telemetry               | done          | M1: pcap thread + radiotap parse → /events |
+| Production binary (Rust serves SPA) | done          | M3: `WIFIE_SERVE_DIR` + `./run.sh --prod` |
+| Wiphy-aware supported_bands_ghz     | done          | M4: NetlinkBackend caches list_physical_devices |
+| Lab authorization gate              | done          | `WIFIE_LAB_AUTHORIZED_BSSIDS`, `src/auth.rs` |
 
 ### Repo layout
 
@@ -198,55 +200,44 @@ curl localhost:3000/api/interfaces        # what radios are visible?
 
 ## Next milestones — work through these in order
 
-The order is deliberate: each step unlocks the next, and earlier ones
-de-risk the harder later ones. Each should be its own commit (or two).
+The original M1–M5 from the founding plan are all landed. The next
+batch is about polish, hardening, and bridging from "the runners
+exist" to "the runners produce verified results against the user's
+own lab AP."
 
-### M1 — Real packet telemetry (replace synthetic counter)
-Replace `spawn_telemetry` in `src/main.rs` with a `pcap::Capture`
-worker bound to the active monitor-mode interface. Emit real
-`packets_per_second`, parse radiotap headers for `noise_floor_dbm` and
-RSSI, and broadcast over the existing `/events` namespace. Expose
-start/stop control through `WirelessBackend` (likely a new
-`start_capture(if_name) -> StreamHandle` method) so the mock backend
-can replay a stored pcap for demos.
+### N1 — Disk persistence for capture tasks
+Right now `CaptureRegistry` is an in-memory `HashMap<Uuid, CaptureTask>`.
+Survive a restart by writing each task as JSON next to its `.pcap`
+artifact under `~/.local/share/wifie/captures/`. Reload on startup.
 
-### M2 — Handshake capture pipeline
-Two halves:
-- **Capture**: pcap loop with an EAPOL filter; write `.pcap` artifacts
-  under `~/.local/share/wifie/captures/`. Convert to hashcat 22000
-  format. Persist task records to disk (currently in-memory HashMap).
-- **Trigger**: deauth frame TX. `netlink_wi` 0.8 exposes
-  `NL80211_CMD_FRAME` — try that first. If it proves painful, fall
-  back to `tokio::process` around `aireplay-ng` (subprocess is
-  allowed for active tools per the spec).
-- Surface artifact paths and a "Download .pcap" link in the UI.
-- **Authorization gate** must land in this milestone — no targeted
-  deauth without an allowlist check.
+### N2 — Convert captured handshakes to hashcat 22000 format
+Add a small post-capture step that runs `hcxpcapngtool -o <id>.22000
+<id>.pcap` (subprocess; ship a "Download .22000" link in the UI).
+Tool path discovery + tool_missing error using the same pattern as
+`src/vuln.rs`.
 
-### M3 — Production binary (single-port distribution)
-Wire `tower-http::ServeDir` so the Rust binary serves
-`frontend/dist/` directly. Add `./run.sh --prod` that runs
-`npm run build` then execs the release binary. Goal: one `scp`-able
-artifact for any lab machine, no Vite needed.
+### N3 — UI: artifact downloads + lab BSSID display
+HandshakePanel should surface the artifact path with a download link
+(serve from a new `/api/captures/handshake/:id/artifact` route),
+and the dashboard footer / Notes card should show
+`/api/auth/lab-bssids` so operators see exactly what's authorized
+without grepping their environment.
 
-### M4 — Wiphy-aware band info
-Use `socket.list_physical_devices()` to populate
-`supported_bands_ghz` from the actual hardware capability set instead
-of the heuristic that infers from current frequency.
+### N4 — Verified offensive run on the user's Alfa
+The infrastructure is real but the operator-side verification isn't.
+Walk through one full WPA2 handshake capture against a controlled lab
+AP, confirm the resulting `.pcap` cracks under hashcat with a known
+PSK. This is the milestone that turns "the pipeline runs" into "the
+pipeline works." **Note**: the Alfa is validated for WPA2 cap/crack;
+KRACK and SAE downgrade depend on injection capabilities that haven't
+been exercised — do those second, with a small expected-failure budget.
 
-### M5 — Vuln-test runners (Module 3, the hardest)
-Real Dragonblood / SAE timing probe and KRACK 4-way replay. **Note
-from the user**: the current Alfa adapter has not been validated for
-MitM; first-time tests must use a controlled lab AP. Plan for a small
-expected-failure budget — frame injection on rtl88xxau-style chipsets
-is famously finicky. Strong authorization gate is required.
-
-### Smaller polish items (slot in opportunistically)
-- `rust-toolchain.toml` to pin the compiler for OSS contributors.
-- `CONTRIBUTING.md` with the "good first issue" list pulled from this
-  next-steps section.
-- GitHub Actions: cargo build + clippy + frontend build on PRs.
-- A demo `.pcap` checked in for the mock backend to replay.
+### N5 — CI + contributor polish
+- `rust-toolchain.toml` pinning stable.
+- GitHub Actions: cargo build + clippy + npm run build on PRs.
+- `CONTRIBUTING.md` with "good first issue" list pulled from this
+  section.
+- A small demo `.pcap` checked in for the mock backend to replay.
 
 ---
 
