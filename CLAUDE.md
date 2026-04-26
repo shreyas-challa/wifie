@@ -82,6 +82,7 @@ networks the operator doesn't control.
 | Capture task disk persistence       | done          | N1: JSON sidecar per task; reload on startup |
 | Hashcat 22000 conversion            | done          | N2: hcxpcapngtool post-capture; tool_missing surfaced |
 | Artifact downloads + lab BSSID UI   | done          | N3: `/api/captures/handshake/:id/artifact?kind=…`, Notes card lists allowlist |
+| CI + contributor docs               | done          | N5: GH Actions (cargo build/clippy + npm build), CONTRIBUTING.md, rust-toolchain.toml |
 
 ### Repo layout
 
@@ -237,12 +238,14 @@ pipeline works." **Note**: the Alfa is validated for WPA2 cap/crack;
 KRACK and SAE downgrade depend on injection capabilities that haven't
 been exercised — do those second, with a small expected-failure budget.
 
-### N5 — CI + contributor polish
-- `rust-toolchain.toml` pinning stable.
-- GitHub Actions: cargo build + clippy + npm run build on PRs.
-- `CONTRIBUTING.md` with "good first issue" list pulled from this
-  section.
-- A small demo `.pcap` checked in for the mock backend to replay.
+### N5 — CI + contributor polish ✓ (mostly) done
+- `rust-toolchain.toml` pinning stable + clippy + rustfmt.
+- `.github/workflows/ci.yml` runs cargo build + clippy `-D warnings`
+  and `npm run build` on every PR.
+- `CONTRIBUTING.md` lists ground rules, dev loop, and a fresh "good
+  first issue" set.
+- Still open: a demo `.pcap` checked in for the mock backend to
+  replay so the telemetry graph isn't flat in mock mode.
 
 ---
 

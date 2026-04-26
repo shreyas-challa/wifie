@@ -71,13 +71,13 @@ impl NetlinkBackend {
 
 fn supported_bands_of(dev: &netlink_wi::wiphy::PhysicalDevice) -> Vec<f32> {
     let mut bands = Vec::new();
-    if dev.band_2ghz.as_ref().map_or(false, |b| !b.frequencies.is_empty()) {
+    if dev.band_2ghz.as_ref().is_some_and(|b| !b.frequencies.is_empty()) {
         bands.push(2.4);
     }
-    if dev.band_5ghz.as_ref().map_or(false, |b| !b.frequencies.is_empty()) {
+    if dev.band_5ghz.as_ref().is_some_and(|b| !b.frequencies.is_empty()) {
         bands.push(5.0);
     }
-    if dev.band_6ghz.as_ref().map_or(false, |b| !b.frequencies.is_empty()) {
+    if dev.band_6ghz.as_ref().is_some_and(|b| !b.frequencies.is_empty()) {
         bands.push(6.0);
     }
     bands

@@ -141,5 +141,14 @@ WIFIE_BACKEND_URL=http://10.0.0.5:3000 ./run.sh --frontend-only
 ## Safety
 
 This project exists for authorized lab testing on networks the operator owns
-or has explicit permission to attack. The active offensive modules ship as
-stubs — wire them only inside that authorization boundary.
+or has explicit permission to attack. Every offensive code path is gated
+behind the `WIFIE_LAB_AUTHORIZED_BSSIDS` allowlist (`src/auth.rs`); an unset
+env var means deny-everything. The dashboard's Notes card surfaces the
+current allowlist so operators see what they're authorized to touch without
+grepping their environment.
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the ground rules, dev loop, and
+the current "good first issue" list. CI on every PR runs `cargo build`,
+`cargo clippy -- -D warnings`, and the frontend `npm run build`.
