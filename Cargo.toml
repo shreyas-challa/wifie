@@ -25,6 +25,8 @@ thiserror = "1"
 [target.'cfg(target_os = "linux")'.dependencies]
 netlink_wi = { version = "0.8", features = ["async"] }
 pcap = "2.2"
+rtnetlink = "0.14"
+futures = "0.3"
 
 [profile.release]
 lto = true

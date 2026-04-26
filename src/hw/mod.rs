@@ -8,6 +8,8 @@
 pub mod mock;
 
 #[cfg(target_os = "linux")]
+pub mod link;
+#[cfg(target_os = "linux")]
 pub mod netlink;
 
 use async_trait::async_trait;

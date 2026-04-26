@@ -15,17 +15,20 @@ use netlink_wi::{
 use tracing::{debug, warn};
 
 use super::{
-    ChannelWidth, HwError, HwResult, InterfaceMode, WirelessBackend, WirelessInterface,
+    link::LinkController, ChannelWidth, HwError, HwResult, InterfaceMode, WirelessBackend,
+    WirelessInterface,
 };
 
 pub struct NetlinkBackend {
     socket: AsyncNlSocket,
+    link: LinkController,
 }
 
 impl NetlinkBackend {
     pub async fn connect() -> HwResult<Self> {
         let socket = AsyncNlSocket::connect().await.map_err(translate_err)?;
-        Ok(Self { socket })
+        let link = LinkController::connect()?;
+        Ok(Self { socket, link })
     }
 
     async fn find_if_index(&self, name: &str) -> HwResult<u32> {
@@ -60,14 +63,34 @@ impl WirelessBackend for NetlinkBackend {
     async fn set_mode(&self, interface: &str, mode: InterfaceMode) -> HwResult<()> {
         let if_index = self.find_if_index(interface).await?;
         let if_type = mode_to_nl(mode);
-        debug!(if_index, ?if_type, "nl80211: set_interface");
-        if let Err(err) = self.socket.set_interface(if_index, if_type).await {
-            // Many drivers refuse mode changes while the netdev is UP.
-            // Surface a hint instead of a raw errno.
-            warn!(error=?err, "set_interface failed; the link may need to be brought down");
-            return Err(translate_err(err));
+
+        // Most Wi-Fi drivers reject SET_INTERFACE while the netdev is UP
+        // with EBUSY. Cycle the link around the call. If bringing it down
+        // fails we still try the mode change — some drivers accept it
+        // either way and the user gets a clearer error than a partial
+        // failure halfway through.
+        debug!(if_index, "rtnetlink: set link down before mode change");
+        if let Err(err) = self.link.set_link_down(interface).await {
+            warn!(error=%err, "rtnetlink set_link_down failed; attempting mode change anyway");
         }
-        Ok(())
+
+        debug!(if_index, ?if_type, "nl80211: set_interface");
+        let result = self.socket.set_interface(if_index, if_type).await;
+
+        // Always try to bring the link back up so we don't leave the
+        // operator with a dead interface, even if the mode change failed.
+        debug!(if_index, "rtnetlink: set link back up");
+        if let Err(err) = self.link.set_link_up(interface).await {
+            warn!(error=%err, "rtnetlink set_link_up failed after mode change; interface may be left DOWN");
+        }
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!(error=?err, "set_interface failed");
+                Err(translate_err(err))
+            }
+        }
     }
 
     async fn set_channel(
