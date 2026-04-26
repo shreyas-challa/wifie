@@ -20,7 +20,9 @@ import { InterfacePanel } from "./components/InterfacePanel";
 import { HandshakePanel } from "./components/HandshakePanel";
 import { VulnLabPanel } from "./components/VulnLabPanel";
 
-const API_BASE = "http://localhost:3000";
+// Same-origin: API and socket.io requests are proxied to the Rust backend
+// by Vite in dev (vite.config.js) and by the binary itself in prod.
+const API_BASE = "";
 
 const SECTIONS = [
   { id: "telemetry", label: "Telemetry", icon: IconActivity },
@@ -49,7 +51,7 @@ function Dashboard() {
   const [activeSection, setActiveSection] = useState("telemetry");
 
   const socket = useMemo(
-    () => io(`${API_BASE}/events`, { transports: ["websocket"] }),
+    () => io("/events", { transports: ["websocket"] }),
     []
   );
 
