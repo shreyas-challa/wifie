@@ -79,6 +79,7 @@ networks the operator doesn't control.
 | Production binary (Rust serves SPA) | done          | M3: `WIFIE_SERVE_DIR` + `./run.sh --prod` |
 | Wiphy-aware supported_bands_ghz     | done          | M4: NetlinkBackend caches list_physical_devices |
 | Lab authorization gate              | done          | `WIFIE_LAB_AUTHORIZED_BSSIDS`, `src/auth.rs` |
+| Capture task disk persistence       | done          | N1: JSON sidecar per task; reload on startup |
 
 ### Repo layout
 
@@ -205,10 +206,11 @@ batch is about polish, hardening, and bridging from "the runners
 exist" to "the runners produce verified results against the user's
 own lab AP."
 
-### N1 — Disk persistence for capture tasks
-Right now `CaptureRegistry` is an in-memory `HashMap<Uuid, CaptureTask>`.
-Survive a restart by writing each task as JSON next to its `.pcap`
-artifact under `~/.local/share/wifie/captures/`. Reload on startup.
+### N1 — Disk persistence for capture tasks ✓ done
+JSON sidecar per task lives next to its pcap under
+`~/.local/share/wifie/captures/<id>.json`. Persisted on every status
+change. `handshake::load_persisted()` rehydrates the registry on
+startup and demotes any in-flight (Pending/Running) tasks to Failed.
 
 ### N2 — Convert captured handshakes to hashcat 22000 format
 Add a small post-capture step that runs `hcxpcapngtool -o <id>.22000

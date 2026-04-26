@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -20,7 +19,7 @@ use socketioxide::{
     extract::{Data, SocketRef},
     SocketIo,
 };
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing::{error, info, warn};
@@ -143,7 +142,7 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         backend,
-        captures: Arc::new(RwLock::new(HashMap::new())),
+        captures: handshake::load_persisted(),
         telemetry: Arc::new(Mutex::new(None)),
         io: io.clone(),
         seq: Arc::new(AtomicU64::new(0)),

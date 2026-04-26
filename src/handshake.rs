@@ -11,7 +11,7 @@
 
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -73,6 +73,84 @@ pub fn captures_dir() -> PathBuf {
         .join("wifie/captures")
 }
 
+fn task_json_path(dir: &Path, id: Uuid) -> PathBuf {
+    dir.join(format!("{id}.json"))
+}
+
+/// Write the task as a JSON sidecar next to its pcap. Atomic-ish:
+/// write to `<id>.json.tmp`, then rename. Logs and swallows errors —
+/// persistence failure must never crash the capture worker.
+fn persist_task(task: &CaptureTask) {
+    let dir = captures_dir();
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        warn!(task = %task.id, ?err, "persist: mkdir failed");
+        return;
+    }
+    let final_path = task_json_path(&dir, task.id);
+    let tmp_path = dir.join(format!("{}.json.tmp", task.id));
+    let bytes = match serde_json::to_vec_pretty(task) {
+        Ok(b) => b,
+        Err(err) => {
+            warn!(task = %task.id, ?err, "persist: serialize failed");
+            return;
+        }
+    };
+    if let Err(err) = std::fs::write(&tmp_path, &bytes) {
+        warn!(task = %task.id, ?err, "persist: tmp write failed");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, &final_path) {
+        warn!(task = %task.id, ?err, "persist: rename failed");
+    }
+}
+
+/// Reload all `<id>.json` sidecars from `captures_dir()` into a fresh
+/// registry. Tasks left in `Pending` or `Running` from a prior process
+/// are forced to `Failed` with a reason — they cannot resume across a
+/// restart since their pcap session is gone.
+pub fn load_persisted() -> CaptureRegistry {
+    let mut map: HashMap<Uuid, CaptureTask> = HashMap::new();
+    let dir = captures_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(it) => it,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(?err, dir = %dir.display(), "load_persisted: read_dir failed");
+            }
+            return Arc::new(RwLock::new(map));
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(?err, path = %path.display(), "load_persisted: read failed");
+                continue;
+            }
+        };
+        let mut task: CaptureTask = match serde_json::from_slice(&bytes) {
+            Ok(t) => t,
+            Err(err) => {
+                warn!(?err, path = %path.display(), "load_persisted: parse failed");
+                continue;
+            }
+        };
+        if matches!(task.status, TaskStatus::Pending | TaskStatus::Running) {
+            task.status = TaskStatus::Failed;
+            task.error = Some("interrupted: server restarted before capture finished".into());
+            task.updated_at = Utc::now();
+            persist_task(&task);
+        }
+        map.insert(task.id, task);
+    }
+    info!(count = map.len(), "load_persisted: hydrated capture tasks");
+    Arc::new(RwLock::new(map))
+}
+
 /// Spawn a capture task. Returns the initial CaptureTask synchronously
 /// (Pending status); the worker updates the registry as it makes
 /// progress.
@@ -104,6 +182,7 @@ pub async fn spawn(
         error: None,
     };
     registry.write().await.insert(id, task.clone());
+    persist_task(&task);
 
     let registry_for_task = registry.clone();
     tokio::spawn(async move {
@@ -271,23 +350,33 @@ fn run_writer(
 fn block_on_increment(registry: &CaptureRegistry, id: Uuid) {
     let registry = registry.clone();
     // Cheap blocking write — registry lock is short-lived.
-    futures::executor::block_on(async move {
-        if let Some(t) = registry.write().await.get_mut(&id) {
+    let snapshot = futures::executor::block_on(async move {
+        let mut guard = registry.write().await;
+        guard.get_mut(&id).map(|t| {
             t.eapol_frames_seen += 1;
             t.updated_at = Utc::now();
-        }
+            t.clone()
+        })
     });
+    if let Some(t) = snapshot {
+        persist_task(&t);
+    }
 }
 
 fn block_on_set_error(registry: &CaptureRegistry, id: Uuid, err: String) {
     let registry = registry.clone();
-    futures::executor::block_on(async move {
-        if let Some(t) = registry.write().await.get_mut(&id) {
+    let snapshot = futures::executor::block_on(async move {
+        let mut guard = registry.write().await;
+        guard.get_mut(&id).map(|t| {
             t.error = Some(err);
             t.status = TaskStatus::Failed;
             t.updated_at = Utc::now();
-        }
+            t.clone()
+        })
     });
+    if let Some(t) = snapshot {
+        persist_task(&t);
+    }
 }
 
 async fn fail_task(registry: &CaptureRegistry, id: Uuid, err: String) {
@@ -301,9 +390,15 @@ async fn fail_task(registry: &CaptureRegistry, id: Uuid, err: String) {
 }
 
 async fn update_task<F: FnOnce(&mut CaptureTask)>(registry: &CaptureRegistry, id: Uuid, f: F) {
-    let mut guard = registry.write().await;
-    if let Some(t) = guard.get_mut(&id) {
-        f(t);
+    let snapshot = {
+        let mut guard = registry.write().await;
+        guard.get_mut(&id).map(|t| {
+            f(t);
+            t.clone()
+        })
+    };
+    if let Some(t) = snapshot {
+        persist_task(&t);
     }
 }
 
