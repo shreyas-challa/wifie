@@ -1,9 +1,11 @@
 //! In-memory backend for demos, CI, and developing without a radio attached.
 
 use async_trait::async_trait;
-use tokio::sync::RwLock;
+use chrono::Utc;
+use tokio::sync::{mpsc, oneshot, RwLock};
 
 use super::{
+    capture::{CaptureSession, CapturedFrame, LinkType},
     ChannelWidth, HwError, HwResult, InterfaceMode, WirelessBackend, WirelessInterface,
 };
 
@@ -53,6 +55,56 @@ impl WirelessBackend for MockBackend {
         iface.frequency_mhz = Some(frequency_mhz);
         iface.channel_width = Some(width);
         Ok(())
+    }
+
+    async fn start_capture(
+        &self,
+        interface: &str,
+        _bpf_filter: Option<&str>,
+    ) -> HwResult<CaptureSession> {
+        // Confirm the interface exists; otherwise the consumer would just
+        // see an idle channel and wonder.
+        if !self
+            .state
+            .read()
+            .await
+            .iter()
+            .any(|i| i.name == interface)
+        {
+            return Err(HwError::InterfaceNotFound(interface.to_string()));
+        }
+
+        let (frames_tx, frames_rx) = mpsc::channel(256);
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+
+        // Synthetic stream: ~120 pps with 5 ms jitter so the dashboard's
+        // canvas plot still moves in demo mode without touching a radio.
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(8));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    _ = tick.tick() => {
+                        let frame = CapturedFrame {
+                            timestamp_ms: Utc::now().timestamp_millis(),
+                            link_type: LinkType::IeeeWithRadiotap,
+                            // 64-byte synthetic frame; consumers only count
+                            // it for the rate plot.
+                            raw: vec![0u8; 64],
+                        };
+                        if frames_tx.send(frame).await.is_err() { break; }
+                    }
+                }
+            }
+        });
+
+        Ok(CaptureSession {
+            interface: interface.to_string(),
+            link_type: LinkType::IeeeWithRadiotap,
+            frames: frames_rx,
+            stop: stop_tx,
+        })
     }
 }
 

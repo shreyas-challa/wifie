@@ -1,4 +1,11 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use axum::{
     extract::State,
@@ -7,24 +14,51 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Utc};
+use radiotap::Radiotap;
 use serde::{Deserialize, Serialize};
 use socketioxide::{
     extract::{Data, SocketRef},
     SocketIo,
 };
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod hw;
 
-use hw::{ChannelWidth, HwError, InterfaceMode, SharedBackend};
+use hw::{
+    capture::{CapturedFrame, LinkType, TelemetryTick},
+    ChannelWidth, HwError, InterfaceMode, SharedBackend,
+};
+
+const TELEMETRY_WINDOW_MS: u64 = 100;
 
 #[derive(Clone)]
 struct AppState {
     backend: SharedBackend,
     captures: Arc<RwLock<HashMap<Uuid, CaptureTask>>>,
+    telemetry: Arc<Mutex<Option<TelemetrySession>>>,
+    io: SocketIo,
+    seq: Arc<AtomicU64>,
+}
+
+struct TelemetrySession {
+    interface: String,
+    handle: JoinHandle<()>,
+    /// Held to keep the capture alive; dropping it stops the worker.
+    _stop: tokio::sync::oneshot::Sender<()>,
+}
+
+impl TelemetrySession {
+    async fn shutdown(self) {
+        // Drop _stop by destructuring; the worker pcap thread will exit
+        // on its next 200 ms timeout, then this join returns.
+        let TelemetrySession { handle, .. } = self;
+        handle.abort();
+        let _ = handle.await;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +99,6 @@ struct MonitorModeRequest {
 struct ChannelRequest {
     interface: String,
     frequency_mhz: u32,
-    /// Optional channel width override; defaults to a sane value for the band.
     #[serde(default)]
     width: Option<ChannelWidth>,
 }
@@ -86,6 +119,11 @@ struct VulnerabilityTestRequest {
     test_case: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TelemetryStartRequest {
+    interface: String,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -98,35 +136,35 @@ async fn main() -> anyhow::Result<()> {
             b
         }
         Err(err) => {
-            warn!(
-                error = %err,
-                "real wireless backend unavailable; falling back to mock backend"
-            );
+            warn!(error = %err, "real wireless backend unavailable; falling back to mock backend");
             Arc::new(hw::mock::MockBackend::seeded()) as SharedBackend
         }
     };
 
+    let (io_layer, io) = SocketIo::builder().build_layer();
+    io.ns("/events", on_socket_connect);
+
     let state = AppState {
         backend,
         captures: Arc::new(RwLock::new(HashMap::new())),
+        telemetry: Arc::new(Mutex::new(None)),
+        io: io.clone(),
+        seq: Arc::new(AtomicU64::new(0)),
     };
-
-    let (io_layer, io) = SocketIo::builder().build_layer();
-    io.ns("/events", on_socket_connect);
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/interfaces", get(list_interfaces))
         .route("/api/interfaces/monitor-mode", post(toggle_monitor_mode))
         .route("/api/interfaces/channel", post(set_channel))
+        .route("/api/telemetry/start", post(start_telemetry))
+        .route("/api/telemetry/stop", post(stop_telemetry))
         .route("/api/captures/handshake", post(start_handshake_capture))
         .route("/api/vuln-tests/start", post(start_vuln_test_stub))
         .with_state(state)
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .layer(io_layer);
-
-    spawn_telemetry(io);
 
     let addr: SocketAddr = "0.0.0.0:3000".parse()?;
     info!(%addr, "listening");
@@ -157,33 +195,18 @@ fn on_socket_connect(socket: SocketRef) {
     );
 }
 
-fn spawn_telemetry(io: SocketIo) {
-    tokio::spawn(async move {
-        let mut counter: u64 = 0;
-        loop {
-            counter += 1;
-            if let Some(ns) = io.of("/events") {
-                ns.emit(
-                    "packet:tick",
-                    &serde_json::json!({
-                        "seq": counter,
-                        "packets_per_second": 700 + ((counter % 100) as i32),
-                        "noise_floor_dbm": -95 + ((counter % 5) as i32),
-                        "timestamp": Utc::now().timestamp_millis(),
-                    }),
-                )
-                .ok();
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        }
-    });
-}
-
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    let telemetry_iface = state
+        .telemetry
+        .lock()
+        .await
+        .as_ref()
+        .map(|s| s.interface.clone());
     Json(serde_json::json!({
         "status": "ok",
         "service": "wifie-server",
         "backend": state.backend.name(),
+        "telemetry_interface": telemetry_iface,
     }))
 }
 
@@ -206,10 +229,39 @@ async fn toggle_monitor_mode(
     } else {
         InterfaceMode::Managed
     };
-    match state.backend.set_mode(&req.interface, mode).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true, "interface": req.interface, "mode": mode })),
-        Err(err) => err_to_json(err),
+
+    // If we're flipping the active telemetry source, stop it first so
+    // the link-cycle inside set_mode doesn't fail with "device busy in
+    // pcap" on stricter drivers.
+    {
+        let mut guard = state.telemetry.lock().await;
+        if guard
+            .as_ref()
+            .map(|s| s.interface == req.interface)
+            .unwrap_or(false)
+        {
+            if let Some(session) = guard.take() {
+                session.shutdown().await;
+            }
+        }
     }
+
+    if let Err(err) = state.backend.set_mode(&req.interface, mode).await {
+        return err_to_json(err);
+    }
+
+    // Auto-bind telemetry on monitor enable; stop it on monitor disable.
+    if req.enable {
+        if let Err(err) = bind_telemetry(&state, &req.interface).await {
+            warn!(error = %err, "auto-bind telemetry after monitor enable failed");
+        }
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "interface": req.interface,
+        "mode": mode,
+    }))
 }
 
 async fn set_channel(
@@ -231,6 +283,97 @@ async fn set_channel(
             "width": width,
         })),
         Err(err) => err_to_json(err),
+    }
+}
+
+async fn start_telemetry(
+    State(state): State<AppState>,
+    Json(req): Json<TelemetryStartRequest>,
+) -> impl IntoResponse {
+    match bind_telemetry(&state, &req.interface).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true, "interface": req.interface })),
+        Err(err) => err_to_json(err),
+    }
+}
+
+async fn stop_telemetry(State(state): State<AppState>) -> impl IntoResponse {
+    let mut guard = state.telemetry.lock().await;
+    let was = guard.take().map(|s| s.interface.clone());
+    if let Some(session) = guard.take() {
+        session.shutdown().await;
+    }
+    drop(guard);
+    Json(serde_json::json!({ "ok": true, "stopped": was }))
+}
+
+async fn bind_telemetry(state: &AppState, interface: &str) -> HwResult<()> {
+    let session = state.backend.start_capture(interface, None).await?;
+    let frames = session.frames;
+    let link_type = session.link_type;
+    let interface_owned = interface.to_string();
+    let io = state.io.clone();
+    let seq = state.seq.clone();
+
+    let handle = tokio::spawn(async move {
+        forward_telemetry(io, seq, link_type, frames).await;
+    });
+
+    let mut guard = state.telemetry.lock().await;
+    if let Some(prev) = guard.take() {
+        prev.shutdown().await;
+    }
+    *guard = Some(TelemetrySession {
+        interface: interface_owned,
+        handle,
+        _stop: session.stop,
+    });
+    Ok(())
+}
+
+async fn forward_telemetry(
+    io: SocketIo,
+    seq: Arc<AtomicU64>,
+    link_type: LinkType,
+    mut frames: tokio::sync::mpsc::Receiver<CapturedFrame>,
+) {
+    let mut window_count: u32 = 0;
+    let mut last_noise: Option<i32> = None;
+    let mut last_rssi: Option<i32> = None;
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(TELEMETRY_WINDOW_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            maybe_frame = frames.recv() => {
+                match maybe_frame {
+                    Some(frame) => {
+                        window_count += 1;
+                        if matches!(link_type, LinkType::IeeeWithRadiotap) {
+                            if let Ok(rt) = Radiotap::from_bytes(&frame.raw) {
+                                if let Some(n) = rt.antenna_noise { last_noise = Some(n.value as i32); }
+                                if let Some(s) = rt.antenna_signal { last_rssi = Some(s.value as i32); }
+                            }
+                        }
+                    }
+                    None => break, // capture stopped
+                }
+            }
+            _ = tick.tick() => {
+                let pps = window_count.saturating_mul((1000 / TELEMETRY_WINDOW_MS) as u32);
+                window_count = 0;
+                let s = seq.fetch_add(1, Ordering::Relaxed) + 1;
+                let payload = TelemetryTick {
+                    seq: s,
+                    timestamp_ms: Utc::now().timestamp_millis(),
+                    packets_per_second: pps,
+                    noise_floor_dbm: last_noise,
+                    rssi_dbm: last_rssi,
+                };
+                if let Some(ns) = io.of("/events") {
+                    ns.emit("packet:tick", &payload).ok();
+                }
+            }
+        }
     }
 }
 
@@ -282,3 +425,5 @@ fn err_to_json(err: HwError) -> Json<serde_json::Value> {
         "message": err.to_string(),
     }))
 }
+
+type HwResult<T> = Result<T, HwError>;

@@ -5,12 +5,15 @@
 //! drives real Wi-Fi adapters via nl80211. New backends (USRP, virtual sniffer
 //! pcap replays, remote agents) plug in by implementing the same trait.
 
+pub mod capture;
 pub mod mock;
 
 #[cfg(target_os = "linux")]
 pub mod link;
 #[cfg(target_os = "linux")]
 pub mod netlink;
+
+pub use capture::CaptureSession;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -92,6 +95,16 @@ pub trait WirelessBackend: Send + Sync {
         frequency_mhz: u32,
         width: ChannelWidth,
     ) -> HwResult<()>;
+
+    /// Start a capture worker on the interface. Frames flow on the
+    /// returned session's `frames` receiver until `stop` is signalled or
+    /// the receiver is dropped. Caller is responsible for ensuring the
+    /// interface is in a useful state (Monitor for over-the-air capture).
+    async fn start_capture(
+        &self,
+        interface: &str,
+        bpf_filter: Option<&str>,
+    ) -> HwResult<CaptureSession>;
 }
 
 /// Shared handle the HTTP layer holds; lets us swap backends without changing

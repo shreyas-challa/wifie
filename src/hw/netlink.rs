@@ -5,6 +5,7 @@
 //! types.
 
 use async_trait::async_trait;
+use chrono::Utc;
 use netlink_wi::{
     interface::{
         ChannelWidth as NlChannelWidth, InterfaceType as NlInterfaceType,
@@ -12,11 +13,14 @@ use netlink_wi::{
     },
     AsyncNlSocket, ChannelConfig, NlError,
 };
-use tracing::{debug, warn};
+use pcap::{Capture, Linktype};
+use tokio::sync::{mpsc, oneshot};
+use tracing::{debug, error, warn};
 
 use super::{
-    link::LinkController, ChannelWidth, HwError, HwResult, InterfaceMode, WirelessBackend,
-    WirelessInterface,
+    capture::{CaptureSession, CapturedFrame, LinkType},
+    link::LinkController,
+    ChannelWidth, HwError, HwResult, InterfaceMode, WirelessBackend, WirelessInterface,
 };
 
 pub struct NetlinkBackend {
@@ -103,6 +107,105 @@ impl WirelessBackend for NetlinkBackend {
         let cfg = ChannelConfig::new(if_index, frequency_mhz, width_to_nl(width));
         debug!(if_index, frequency_mhz, ?width, "nl80211: set_channel");
         self.socket.set_channel(cfg).await.map_err(translate_err)
+    }
+
+    async fn start_capture(
+        &self,
+        interface: &str,
+        bpf_filter: Option<&str>,
+    ) -> HwResult<CaptureSession> {
+        // Open the pcap handle before the worker thread so any error
+        // (interface missing, EPERM, etc.) surfaces synchronously to the
+        // caller instead of being lost inside the spawn.
+        let mut cap = Capture::from_device(interface)
+            .map_err(|e| pcap_to_hw(interface, e))?
+            .promisc(true)
+            .immediate_mode(true)
+            .snaplen(65535)
+            .timeout(200)
+            .open()
+            .map_err(|e| pcap_to_hw(interface, e))?;
+
+        if let Some(filter) = bpf_filter {
+            cap.filter(filter, true)
+                .map_err(|e| HwError::Other(format!("bad bpf filter `{filter}`: {e}")))?;
+        }
+
+        let datalink = cap.get_datalink();
+        let link_type = link_type_from_pcap(datalink);
+
+        let (frames_tx, frames_rx) = mpsc::channel::<CapturedFrame>(1024);
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let if_name = interface.to_string();
+
+        // pcap is blocking; isolate it on the blocking pool. Stop signal
+        // is checked between packets via a try_recv since pcap_next_ex
+        // can't be cancelled mid-call (we use a 200 ms read timeout to
+        // bound the worst-case shutdown latency).
+        std::thread::Builder::new()
+            .name(format!("wifie-pcap-{if_name}"))
+            .spawn(move || {
+                let mut stop_rx = stop_rx;
+                loop {
+                    match stop_rx.try_recv() {
+                        Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                        Err(oneshot::error::TryRecvError::Empty) => {}
+                    }
+                    match cap.next_packet() {
+                        Ok(packet) => {
+                            let frame = CapturedFrame {
+                                timestamp_ms: Utc::now().timestamp_millis(),
+                                link_type,
+                                raw: packet.data.to_vec(),
+                            };
+                            // blocking_send so we exert backpressure on
+                            // the kernel rather than silently dropping
+                            // frames when consumers fall behind.
+                            if frames_tx.blocking_send(frame).is_err() {
+                                break;
+                            }
+                        }
+                        Err(pcap::Error::TimeoutExpired) => continue,
+                        Err(pcap::Error::NoMorePackets) => break,
+                        Err(e) => {
+                            error!(?e, "pcap read error; stopping capture");
+                            break;
+                        }
+                    }
+                }
+                debug!(if_name = %if_name, "pcap worker exiting");
+            })
+            .map_err(|e| HwError::Other(format!("failed to spawn pcap thread: {e}")))?;
+
+        Ok(CaptureSession {
+            interface: interface.to_string(),
+            link_type,
+            frames: frames_rx,
+            stop: stop_tx,
+        })
+    }
+}
+
+fn link_type_from_pcap(dlt: Linktype) -> LinkType {
+    // Linktype is a thin newtype around c_int; match on the well-known
+    // numeric constants from <pcap/dlt.h>.
+    match dlt.0 {
+        1 => LinkType::Ethernet,
+        105 => LinkType::Ieee80211,
+        127 => LinkType::IeeeWithRadiotap,
+        _ => LinkType::Other,
+    }
+}
+
+fn pcap_to_hw(interface: &str, err: pcap::Error) -> HwError {
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("permission") || lower.contains("operation not permitted") {
+        HwError::PermissionDenied
+    } else if lower.contains("no such device") || lower.contains("not found") {
+        HwError::InterfaceNotFound(interface.to_string())
+    } else {
+        HwError::Other(msg)
     }
 }
 
