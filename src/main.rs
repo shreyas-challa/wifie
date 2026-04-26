@@ -7,8 +7,10 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, State},
-    response::IntoResponse,
+    body::Body,
+    extract::{Path, Query, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -157,6 +159,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/telemetry/stop", post(stop_telemetry))
         .route("/api/captures/handshake", get(list_captures).post(start_handshake_capture))
         .route("/api/captures/handshake/:id", get(get_capture))
+        .route("/api/captures/handshake/:id/artifact", get(download_artifact))
         .route("/api/captures/deauth", post(send_deauth))
         .route("/api/auth/lab-bssids", get(list_authorized_bssids))
         .route("/api/vuln-tests/start", post(start_vuln_test_stub))
@@ -474,6 +477,79 @@ async fn get_capture(
             "message": format!("no capture task with id {id}"),
         })),
     }
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactQuery {
+    /// `pcap` | `22000`. Defaults to `pcap`.
+    #[serde(default)]
+    kind: Option<String>,
+}
+
+/// Stream the on-disk artifact for a capture task. The path is derived
+/// from `captures_dir() + id + extension` — we deliberately ignore the
+/// path stored in the task so a malformed task can't redirect us
+/// outside the captures directory.
+async fn download_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<ArtifactQuery>,
+) -> Response {
+    if state.captures.read().await.get(&id).is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "not_found",
+                "message": format!("no capture task with id {id}"),
+            })),
+        )
+            .into_response();
+    }
+
+    let kind = q.kind.as_deref().unwrap_or("pcap");
+    let (ext, content_type) = match kind {
+        "pcap" => ("pcap", "application/vnd.tcpdump.pcap"),
+        "22000" => ("22000", "text/plain; charset=utf-8"),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "bad_kind",
+                    "message": format!("unknown artifact kind '{other}', expected pcap or 22000"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let path = handshake::captures_dir().join(format!("{id}.{ext}"));
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(err) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "artifact_missing",
+                    "message": format!("{}: {err}", path.display()),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let filename = format!("wifie-{id}.{ext}");
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn send_deauth(Json(req): Json<DeauthRequest>) -> Json<serde_json::Value> {

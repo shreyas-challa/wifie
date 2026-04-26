@@ -81,6 +81,7 @@ networks the operator doesn't control.
 | Lab authorization gate              | done          | `WIFIE_LAB_AUTHORIZED_BSSIDS`, `src/auth.rs` |
 | Capture task disk persistence       | done          | N1: JSON sidecar per task; reload on startup |
 | Hashcat 22000 conversion            | done          | N2: hcxpcapngtool post-capture; tool_missing surfaced |
+| Artifact downloads + lab BSSID UI   | done          | N3: `/api/captures/handshake/:id/artifact?kind=…`, Notes card lists allowlist |
 
 ### Repo layout
 
@@ -220,12 +221,12 @@ the task. Failure modes (`tool_missing`, exit-code, no hashes
 extracted) surface in `conversion_error` so the UI can render them
 without inventing an error type.
 
-### N3 — UI: artifact downloads + lab BSSID display
-HandshakePanel should surface the artifact path with a download link
-(serve from a new `/api/captures/handshake/:id/artifact` route),
-and the dashboard footer / Notes card should show
-`/api/auth/lab-bssids` so operators see exactly what's authorized
-without grepping their environment.
+### N3 — UI: artifact downloads + lab BSSID display ✓ done
+`GET /api/captures/handshake/:id/artifact?kind=pcap|22000` streams
+each artifact with a sane Content-Disposition. HandshakePanel renders
+download chips for completed tasks and surfaces the conversion error
+inline. The Notes card calls `/api/auth/lab-bssids` and shows the
+allowlist (or an empty-state hint pointing at the env var).
 
 ### N4 — Verified offensive run on the user's Alfa
 The infrastructure is real but the operator-side verification isn't.

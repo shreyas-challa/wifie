@@ -47,6 +47,7 @@ function Dashboard() {
   const [targetClient, setTargetClient] = useState("");
   const [captureType, setCaptureType] = useState("wpa2_handshake");
   const [recentCaptures, setRecentCaptures] = useState([]);
+  const [labAuth, setLabAuth] = useState({ env_var: "", bssids: [] });
   const [busy, setBusy] = useState(false);
   const [activeSection, setActiveSection] = useState("telemetry");
 
@@ -66,6 +67,21 @@ function Dashboard() {
       .catch(() => {
         setInterfaces([]);
       });
+
+    fetch(`${API_BASE}/api/captures/handshake`)
+      .then((r) => r.json())
+      .then((tasks) => Array.isArray(tasks) && setRecentCaptures(tasks.slice(0, 6)))
+      .catch(() => {});
+
+    fetch(`${API_BASE}/api/auth/lab-bssids`)
+      .then((r) => r.json())
+      .then((data) => setLabAuth(data || { env_var: "", bssids: [] }))
+      .catch(() => {});
+  }, []);
+
+  const refreshCaptures = useCallback(async () => {
+    const fresh = await fetch(`${API_BASE}/api/captures/handshake`).then((r) => r.json());
+    if (Array.isArray(fresh)) setRecentCaptures(fresh.slice(0, 6));
   }, []);
 
   useEffect(() => {
@@ -141,6 +157,11 @@ function Dashboard() {
     });
     if (out?.task) {
       setRecentCaptures((prev) => [out.task, ...prev].slice(0, 6));
+      // Capture worker runs ~60s + a 22000 conversion; poll a couple
+      // of times so the artifact download links appear without a
+      // manual refresh.
+      const interval = setInterval(refreshCaptures, 5000);
+      setTimeout(() => clearInterval(interval), 90_000);
     }
   };
 
@@ -291,6 +312,35 @@ function Dashboard() {
                 and run the backend with CAP_NET_ADMIN + CAP_NET_RAW.
               </li>
             </ul>
+
+            <div className="mt-5 rounded-lg border border-border bg-background/60 p-3 dark:bg-neutral-900/40">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                  Lab authorization
+                </p>
+                <span className="font-mono text-[10px] text-muted-foreground">
+                  {labAuth.env_var || "WIFIE_LAB_AUTHORIZED_BSSIDS"}
+                </span>
+              </div>
+              {labAuth.bssids?.length ? (
+                <ul className="mt-2 flex flex-wrap gap-1.5">
+                  {labAuth.bssids.map((b) => (
+                    <li
+                      key={b}
+                      className="rounded-md border border-border bg-background px-2 py-0.5 font-mono text-xs text-foreground dark:bg-neutral-950"
+                    >
+                      {b}
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  No BSSIDs authorized — offensive operations are blocked.
+                  Set <span className="font-mono">{labAuth.env_var || "WIFIE_LAB_AUTHORIZED_BSSIDS"}</span> to
+                  a comma-separated allowlist before starting the backend.
+                </p>
+              )}
+            </div>
           </MinimalCard>
         </RevealOnScroll>
       </main>
