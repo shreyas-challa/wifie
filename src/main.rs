@@ -8,14 +8,14 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use radiotap::Radiotap;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use socketioxide::{
     extract::{Data, SocketRef},
     SocketIo,
@@ -26,8 +26,11 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod auth;
+mod handshake;
 mod hw;
 
+use handshake::{CaptureRegistry, CaptureType, CaptureTask};
 use hw::{
     capture::{CapturedFrame, LinkType, TelemetryTick},
     ChannelWidth, HwError, InterfaceMode, SharedBackend,
@@ -38,7 +41,7 @@ const TELEMETRY_WINDOW_MS: u64 = 100;
 #[derive(Clone)]
 struct AppState {
     backend: SharedBackend,
-    captures: Arc<RwLock<HashMap<Uuid, CaptureTask>>>,
+    captures: CaptureRegistry,
     telemetry: Arc<Mutex<Option<TelemetrySession>>>,
     io: SocketIo,
     seq: Arc<AtomicU64>,
@@ -61,34 +64,6 @@ impl TelemetrySession {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CaptureType {
-    Wpa2Handshake,
-    Wpa3Pmkid,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TaskStatus {
-    Pending,
-    Running,
-    Complete,
-    Failed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CaptureTask {
-    id: Uuid,
-    interface: String,
-    target_bssid: String,
-    capture_type: CaptureType,
-    status: TaskStatus,
-    created_at: DateTime<Utc>,
-    artifact_path: Option<String>,
-    error: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 struct MonitorModeRequest {
     interface: String,
@@ -108,8 +83,29 @@ struct HandshakeCaptureRequest {
     interface: String,
     target_bssid: String,
     target_client: Option<String>,
-    channel_mhz: u32,
+    #[serde(default)]
+    channel_mhz: Option<u32>,
     capture_type: CaptureType,
+    /// If true, fire `count` deauth frames at the target right after the
+    /// capture worker is up. Defaults to false because deauth is destructive.
+    #[serde(default)]
+    deauth: bool,
+    #[serde(default = "default_deauth_count")]
+    deauth_count: u8,
+}
+
+fn default_deauth_count() -> u8 {
+    3
+}
+
+#[derive(Debug, Deserialize)]
+struct DeauthRequest {
+    interface: String,
+    bssid: String,
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default = "default_deauth_count")]
+    count: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,7 +155,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/interfaces/channel", post(set_channel))
         .route("/api/telemetry/start", post(start_telemetry))
         .route("/api/telemetry/stop", post(stop_telemetry))
-        .route("/api/captures/handshake", post(start_handshake_capture))
+        .route("/api/captures/handshake", get(list_captures).post(start_handshake_capture))
+        .route("/api/captures/handshake/:id", get(get_capture))
+        .route("/api/captures/deauth", post(send_deauth))
+        .route("/api/auth/lab-bssids", get(list_authorized_bssids))
         .route("/api/vuln-tests/start", post(start_vuln_test_stub))
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -380,26 +379,117 @@ async fn forward_telemetry(
 async fn start_handshake_capture(
     State(state): State<AppState>,
     Json(req): Json<HandshakeCaptureRequest>,
-) -> impl IntoResponse {
-    let id = Uuid::new_v4();
-    let task = CaptureTask {
-        id,
-        interface: req.interface,
-        target_bssid: req.target_bssid,
-        capture_type: req.capture_type,
-        status: TaskStatus::Pending,
-        created_at: Utc::now(),
-        artifact_path: None,
-        error: None,
+) -> Json<serde_json::Value> {
+    if !auth::is_authorized(&req.target_bssid) {
+        return auth_denied(&req.target_bssid);
+    }
+    if req.target_client.is_none() {
+        warn!("handshake capture requested without target_client (passive only)");
+    }
+
+    // Optional pre-capture channel pin. We don't fail the whole request
+    // if this errors — the operator can still try to capture; they just
+    // won't be locked to the AP's channel.
+    if let Some(freq) = req.channel_mhz {
+        let width = ChannelWidth::default_for_freq(freq);
+        if let Err(err) = state.backend.set_channel(&req.interface, freq, width).await {
+            warn!(error = %err, "pre-capture set_channel failed; continuing");
+        }
+    }
+
+    let task = match handshake::spawn(
+        state.backend.clone(),
+        state.captures.clone(),
+        req.interface.clone(),
+        req.target_bssid.clone(),
+        req.capture_type,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(err) => {
+            return Json(serde_json::json!({
+                "ok": false,
+                "error": "spawn_failed",
+                "message": err,
+            }));
+        }
     };
 
-    if req.target_client.is_none() {
-        warn!("capture requested without target_client, running in passive mode");
+    if req.deauth {
+        let interface = req.interface.clone();
+        let bssid = req.target_bssid.clone();
+        let client = req.target_client.clone();
+        let count = req.deauth_count;
+        // Fire-and-forget; the result is logged. The capture task will
+        // pick up the resulting EAPOL frames if the client reconnects.
+        tokio::spawn(async move {
+            // Brief pause so the pcap worker is reading by the time the
+            // deauths actually go out.
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            match handshake::deauth(&interface, &bssid, client.as_deref(), count).await {
+                Ok(out) => info!(target = %bssid, %count, "deauth sent: {}", out.trim()),
+                Err(err) => warn!(target = %bssid, "deauth failed: {err}"),
+            }
+        });
     }
-    let _channel_hint = req.channel_mhz;
 
-    state.captures.write().await.insert(id, task.clone());
     Json(serde_json::json!({ "ok": true, "task": task }))
+}
+
+async fn list_captures(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut tasks: Vec<CaptureTask> = state.captures.read().await.values().cloned().collect();
+    tasks.sort_by_key(|t| std::cmp::Reverse(t.created_at));
+    Json(serde_json::json!(tasks))
+}
+
+async fn get_capture(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    match state.captures.read().await.get(&id).cloned() {
+        Some(t) => Json(serde_json::json!(t)),
+        None => Json(serde_json::json!({
+            "ok": false,
+            "error": "not_found",
+            "message": format!("no capture task with id {id}"),
+        })),
+    }
+}
+
+async fn send_deauth(Json(req): Json<DeauthRequest>) -> Json<serde_json::Value> {
+    if !auth::is_authorized(&req.bssid) {
+        return auth_denied(&req.bssid);
+    }
+    match handshake::deauth(&req.interface, &req.bssid, req.client.as_deref(), req.count).await {
+        Ok(stdout) => Json(serde_json::json!({ "ok": true, "stdout": stdout })),
+        Err(err) => Json(serde_json::json!({
+            "ok": false,
+            "error": "deauth_failed",
+            "message": err,
+        })),
+    }
+}
+
+async fn list_authorized_bssids() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "env_var": auth::env_var_name(),
+        "bssids": auth::authorized_list(),
+    }))
+}
+
+fn auth_denied(target: &str) -> Json<serde_json::Value> {
+    let env = auth::env_var_name();
+    warn!(target, "rejected: BSSID not in {env}");
+    Json(serde_json::json!({
+        "ok": false,
+        "error": "not_authorized",
+        "message": format!(
+            "target BSSID '{target}' is not in {env}. \
+             Set the env var to a comma-separated allowlist before driving offensive operations."
+        ),
+        "env_var": env,
+    }))
 }
 
 async fn start_vuln_test_stub(Json(req): Json<VulnerabilityTestRequest>) -> impl IntoResponse {
