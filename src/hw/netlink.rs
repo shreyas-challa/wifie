@@ -26,13 +26,33 @@ use super::{
 pub struct NetlinkBackend {
     socket: AsyncNlSocket,
     link: LinkController,
+    /// wiphy_index → supported bands (in GHz). Cached at startup; PHYs
+    /// rarely appear at runtime and the kernel-level cost of refreshing
+    /// per request would dominate.
+    bands_by_wiphy: std::collections::HashMap<u32, Vec<f32>>,
 }
 
 impl NetlinkBackend {
     pub async fn connect() -> HwResult<Self> {
         let socket = AsyncNlSocket::connect().await.map_err(translate_err)?;
         let link = LinkController::connect()?;
-        Ok(Self { socket, link })
+
+        let bands_by_wiphy = match socket.list_physical_devices().await {
+            Ok(devs) => devs
+                .into_iter()
+                .map(|d| (d.wiphy_index, supported_bands_of(&d)))
+                .collect(),
+            Err(err) => {
+                warn!(error=?err, "list_physical_devices failed; falling back to per-frequency band heuristic");
+                std::collections::HashMap::new()
+            }
+        };
+
+        Ok(Self {
+            socket,
+            link,
+            bands_by_wiphy,
+        })
     }
 
     async fn find_if_index(&self, name: &str) -> HwResult<u32> {
@@ -49,6 +69,20 @@ impl NetlinkBackend {
     }
 }
 
+fn supported_bands_of(dev: &netlink_wi::wiphy::PhysicalDevice) -> Vec<f32> {
+    let mut bands = Vec::new();
+    if dev.band_2ghz.as_ref().map_or(false, |b| !b.frequencies.is_empty()) {
+        bands.push(2.4);
+    }
+    if dev.band_5ghz.as_ref().map_or(false, |b| !b.frequencies.is_empty()) {
+        bands.push(5.0);
+    }
+    if dev.band_6ghz.as_ref().map_or(false, |b| !b.frequencies.is_empty()) {
+        bands.push(6.0);
+    }
+    bands
+}
+
 #[async_trait]
 impl WirelessBackend for NetlinkBackend {
     fn name(&self) -> &'static str {
@@ -61,7 +95,10 @@ impl WirelessBackend for NetlinkBackend {
             .list_interfaces()
             .await
             .map_err(translate_err)?;
-        Ok(raw.into_iter().map(translate_interface).collect())
+        Ok(raw
+            .into_iter()
+            .map(|r| translate_interface(r, &self.bands_by_wiphy))
+            .collect())
     }
 
     async fn set_mode(&self, interface: &str, mode: InterfaceMode) -> HwResult<()> {
@@ -221,15 +258,20 @@ fn translate_err(err: NlError) -> HwError {
     }
 }
 
-fn translate_interface(raw: NlWirelessInterface) -> WirelessInterface {
+fn translate_interface(
+    raw: NlWirelessInterface,
+    bands_by_wiphy: &std::collections::HashMap<u32, Vec<f32>>,
+) -> WirelessInterface {
     let mode = raw
         .interface_type
         .map(nl_to_mode)
         .unwrap_or(InterfaceMode::Unspecified);
-    let bands = raw
-        .frequency
-        .map(|f| vec![band_for_freq(f)])
-        .unwrap_or_default();
+    // Prefer the wiphy capability list (M4); fall back to the
+    // current-frequency heuristic if the wiphy lookup didn't fire.
+    let bands = bands_by_wiphy
+        .get(&raw.wiphy_index)
+        .cloned()
+        .unwrap_or_else(|| raw.frequency.map(|f| vec![band_for_freq(f)]).unwrap_or_default());
     WirelessInterface {
         name: raw.name,
         phy: format!("phy{}", raw.wiphy_index),
