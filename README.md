@@ -1,6 +1,6 @@
 # WiFie
 
-Local-host wireless penetration-testing console for Wi-Fi 6 / 6E / 7 audit work
+This is a wireless penetration-testing console for Wi-Fi 6 / 6E / 7 audit work
 in a controlled academic lab. Hardware-agnostic, no proprietary appliance, no
 airmon-ng wrappers — Rust drives `nl80211` and `pcap` directly, the SPA
 frontend renders telemetry on `<canvas>` and lives entirely in the browser.
